@@ -1,0 +1,25 @@
+name:                quickie
+version:             0.1.0.0
+synopsis:            A quick brainfuck compiler / JITed interpreter.
+homepage:            https://github.com/barrucadu/quickie
+license:             MIT
+license-file:        LICENSE
+author:              Michael Walker
+maintainer:          mike@barrucadu.co.uk
+category:            Development
+build-type:          Simple
+cabal-version:       >=1.10
+
+executable quickie
+  main-is:             Main.hs
+  build-depends:       base >=4.9 && <4.10, llvm-hs-pure, quickie
+  hs-source-dirs:      exe
+  default-language:    Haskell2010
+  ghc-options:         -O2 -Wall
+
+library
+  exposed-modules:     Language.Brainfuck
+  build-depends:       base >=4.9 && <4.10, llvm-hs-pure, vector
+  hs-source-dirs:      lib
+  default-language:    Haskell2010
+  ghc-options:         -O2 -Wall

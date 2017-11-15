@@ -1,0 +1,13 @@
+resolver: lts-9.13
+
+packages:
+- .
+
+extra-deps: []
+
+flags: {}
+
+extra-package-dbs: []
+
+nix:
+  packages: [llvm]
