@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ViewPatterns #-}
@@ -9,6 +10,7 @@ import           Data.Bits ((.|.), (.&.), unsafeShiftL, unsafeShiftR)
 import qualified Data.ByteString.Char8 as BS
 import           Data.String (fromString)
 import qualified Data.Vector.Unboxed as V
+import qualified Data.Vector.Unboxed.Mutable as VM
 import qualified Data.Word as W
 import           Foreign.Ptr (FunPtr, castFunPtr)
 import qualified LLVM.AST as AST
@@ -176,7 +178,87 @@ objcompile fname = runLLVM $ \tgt _ m -> LLVM.writeObjectToFile tgt (LLVM.File f
 -- | Compile a brainfuck source program into Quickie intermediate
 -- representation.
 compile :: String -> IR
-compile = error "compile: unimplemented"
+compile s0 = V.create (compile' (filter isbf s0)) where
+  -- filter out non-bf characters so that the run-length encoding is
+  -- simpler
+  isbf c = c `elem` "><+-.,[]"
+
+  -- allocate a mutable vector and write each instruction in turn into
+  -- it
+  compile' scode = do
+    vcode <- VM.unsafeNew chunkSize
+    go vcode 0 chunkSize [] scode
+
+  -- if there's no space left, grow the vector
+  go vcode ip 0 stk cs = do
+    vcode' <- VM.unsafeGrow vcode chunkSize
+    go vcode' ip chunkSize stk cs
+
+  -- if there's no source code left, write a 'Hlt' instruction,
+  -- truncate any extra space in the vector, and return it
+  go vcode ip _ _ [] = do
+    VM.unsafeWrite vcode ip Hlt
+    pure (VM.unsafeSlice 0 (ip+1) vcode)
+
+  -- compile an instruction: 'vcode' is the output vector; 'ip' is the
+  -- instruction pointer for this instruction (which is the same as
+  -- the number of instructions compiled so far); 'sz' is the
+  -- remaining space in the vector; 'stk' is a stack of loop start
+  -- addresses; 'c' is the current instruction and 'cs' is the list of
+  -- later instructions
+  go vcode !ip !sz stk (c:cs) =
+    let
+      -- push an instruction with no operand into the vector and
+      -- continue with the later instructions
+      pushi instr = do
+        VM.unsafeWrite vcode ip instr
+        go vcode (ip+1) (sz-1) stk cs
+
+      -- push an instruction into the vector, where the operand is the
+      -- number of times the current instruction occurs (run-length
+      -- encoding); this means that (eg) "+++" will be compiled to a
+      -- single @Inc 3@, rather than three @Inc 1@s
+      pushir instr = do
+        let (eqs, rest) = span (==c) cs
+        VM.unsafeWrite vcode ip (instr (1 + fromIntegral (length eqs)))
+        go vcode (ip+1) (sz-1) stk rest
+    in case c of
+         '>' -> pushir GoR
+         '<' -> pushir GoL
+         '+' -> pushir Inc
+         '-' -> pushir Dec
+         '.' -> pushi PutCh
+         ',' -> pushi GetCh
+         '[' -> case cs of
+           -- compile "[-]" and "[+]" to a @Set 0@ instruction
+           ('-':']':cs') -> do
+             VM.unsafeWrite vcode ip (Set 0)
+             go vcode (ip+1) (sz-1) stk cs'
+           ('+':']':cs') -> do
+             VM.unsafeWrite vcode ip (Set 0)
+             go vcode (ip+1) (sz-1) stk cs'
+           -- otherwise, write a 'Hlt' for now and push the ip to the
+           -- stack
+           _ -> do
+             VM.unsafeWrite vcode ip Hlt
+             go vcode (ip+1) (sz-1) (ip:stk) cs
+         ']' -> case stk of
+           -- replace the "[" (which was compiled to a 'Hlt') with a
+           -- @JZ <here>@, write a @JNZ <there>@, and pop the stack;
+           -- this is correct as the ip is incremented after every
+           -- instruction (even a jump) in the interpreter, and the
+           -- 'llcompile' function mimics this
+           (p:ps) -> do
+             VM.unsafeWrite vcode p  (JZ  $ fromIntegral ip)
+             VM.unsafeWrite vcode ip (JNZ $ fromIntegral p)
+             go vcode (ip+1) (sz-1) ps cs
+           -- if there isn't a matching "[", just ignore the "]"
+           [] -> go vcode ip sz stk cs
+         _ -> go vcode ip sz stk cs
+
+  -- grow the vector in chunks of 256 instructions, to avoid very
+  -- frequent reallocation
+  chunkSize = 256
 
 -- | Compile a Quickie IR program to LLVM IR.
 llcompile :: IR -> AST.Module
