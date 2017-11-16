@@ -541,7 +541,7 @@ runLLVM f ast =
 
 -- | The name of the brainfuck \"main\" function in the LLVM IR.
 bfmain :: AST.Name
-bfmain = AST.mkName "bfmain"
+bfmain = AST.mkName "main"
 
 -- | The C putchar stdlib function.
 putchar :: AST.Name
