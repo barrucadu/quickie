@@ -6,6 +6,7 @@
 module Language.Brainfuck where
 
 import           Data.Bits ((.|.), (.&.), unsafeShiftL, unsafeShiftR)
+import qualified Data.ByteString.Char8 as BS
 import           Data.String (fromString)
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Word as W
@@ -137,15 +138,17 @@ dumpir = error "dumpir: unimplemented"
 
 -- | Dump the LLVM IR to stdout or a file.
 dumpllvm :: Maybe String -> AST.Module -> IO ()
-dumpllvm = error "dumpllvm: unimplemented"
+dumpllvm (Just fname) = runLLVM $ \_ _ m -> LLVM.writeLLVMAssemblyToFile (LLVM.File fname) m
+dumpllvm Nothing      = runLLVM $ \_ _ m -> LLVM.moduleLLVMAssembly m >>= BS.putStrLn
 
 -- | Dump the LLVM-compiled assembly to stdout or a file.
 dumpasm :: Maybe String -> AST.Module -> IO ()
-dumpasm = error "dumpasm: unimplemented"
+dumpasm (Just fname) = runLLVM $ \tgt _ m -> LLVM.writeTargetAssemblyToFile tgt (LLVM.File fname) m
+dumpasm Nothing      = runLLVM $ \tgt _ m -> LLVM.moduleTargetAssembly tgt m >>= BS.putStrLn
 
 -- | Dump the LLVM-compiled object code to a file.
 objcompile :: String -> AST.Module -> IO ()
-objcompile = error "objcompile: unimplemented"
+objcompile fname = runLLVM $ \tgt _ m -> LLVM.writeObjectToFile tgt (LLVM.File fname) m
 
 
 -------------------------------------------------------------------------------
