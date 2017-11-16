@@ -13,6 +13,7 @@ import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as VM
 import qualified Data.Word as W
 import           Control.Exception (try)
+import           Control.Monad (void, when)
 import           Foreign.Ptr (FunPtr, castFunPtr)
 import qualified LLVM.Analysis as LLVM
 import qualified LLVM.AST as AST hiding (type')
@@ -27,7 +28,9 @@ import qualified LLVM.Context as LLVM
 import qualified LLVM.ExecutionEngine as LLVM
 import qualified LLVM.Exception as LLVM
 import qualified LLVM.Module as LLVM
+import qualified LLVM.PassManager as LLVM
 import qualified LLVM.Target as LLVM
+import qualified LLVM.Transforms as LLVM
 import           System.IO (IOMode(..), hPutStrLn, openFile, stdout)
 import           Text.Printf (printf)
 
@@ -188,7 +191,7 @@ interpret code = run' =<< VM.replicate memSize 0 where
 -- | JIT compile and execute an LLVM IR program.
 jit :: AST.Module -> IO ()
 jit =
-    runLLVM $ \_ ctx m ->
+    runLLVM True $ \_ ctx m ->
     LLVM.withMCJIT ctx optlevel model ptrelim fastins $ \ee ->
     LLVM.withModuleInEngine ee m $ \em ->
     LLVM.getFunction em bfmain >>= \case
@@ -227,21 +230,21 @@ dumpir mfname ir = do
 
 -- | Dump the LLVM IR to stdout or a file.
 dumpllvm :: Maybe String -> AST.Module -> IO ()
-dumpllvm (Just fname) = runLLVM $ \_ _ m -> LLVM.writeLLVMAssemblyToFile (LLVM.File fname) m
-dumpllvm Nothing      = runLLVM $ \_ _ m -> LLVM.moduleLLVMAssembly m >>= BS.putStrLn
+dumpllvm (Just fname) = runLLVM True $ \_ _ m -> LLVM.writeLLVMAssemblyToFile (LLVM.File fname) m
+dumpllvm Nothing      = runLLVM True $ \_ _ m -> LLVM.moduleLLVMAssembly m >>= BS.putStrLn
 
 -- | Dump the LLVM-compiled assembly to stdout or a file.
 dumpasm :: Maybe String -> AST.Module -> IO ()
-dumpasm (Just fname) = runLLVM $ \tgt _ m -> LLVM.writeTargetAssemblyToFile tgt (LLVM.File fname) m
-dumpasm Nothing      = runLLVM $ \tgt _ m -> LLVM.moduleTargetAssembly tgt m >>= BS.putStrLn
+dumpasm (Just fname) = runLLVM True $ \tgt _ m -> LLVM.writeTargetAssemblyToFile tgt (LLVM.File fname) m
+dumpasm Nothing      = runLLVM True $ \tgt _ m -> LLVM.moduleTargetAssembly tgt m >>= BS.putStrLn
 
 -- | Dump the LLVM-compiled object code to a file.
 objcompile :: String -> AST.Module -> IO ()
-objcompile fname = runLLVM $ \tgt _ m -> LLVM.writeObjectToFile tgt (LLVM.File fname) m
+objcompile fname = runLLVM True $ \tgt _ m -> LLVM.writeObjectToFile tgt (LLVM.File fname) m
 
 -- | Run the LLVM verifier and print out the messages.
 verifyllvm :: AST.Module -> IO ()
-verifyllvm = runLLVM $ \_ _ m -> try (LLVM.verify m) >>= \case
+verifyllvm = runLLVM False $ \_ _ m -> try (LLVM.verify m) >>= \case
   Right () -> putStrLn "OK!"
   Left (LLVM.VerifyException err) -> putStr err
 
@@ -558,12 +561,17 @@ unpack16 :: Instruction -> (W.Word32, W.Word16)
 unpack16 instr = (instr .&. 15, fromIntegral (unsafeShiftR instr 4 .&. 65535))
 
 -- | Run an LLVM operation on a module.
-runLLVM :: (LLVM.TargetMachine -> LLVM.Context -> LLVM.Module -> IO ()) -> AST.Module -> IO ()
-runLLVM f ast =
-  LLVM.withHostTargetMachine $ \tgt ->
-  LLVM.withContext $ \ctx ->
-  LLVM.withModuleFromAST ctx ast $
-  f tgt ctx
+runLLVM :: Bool -> (LLVM.TargetMachine -> LLVM.Context -> LLVM.Module -> IO ()) -> AST.Module -> IO ()
+runLLVM optimise f ast =
+    LLVM.withHostTargetMachine $ \tgt ->
+    LLVM.withContext $ \ctx ->
+    LLVM.withModuleFromAST ctx ast $ \m -> do
+      when optimise (LLVM.withPassManager passes $ \pm -> void (LLVM.runPassManager pm m))
+      f tgt ctx m
+  where
+    passes = LLVM.defaultPassSetSpec
+      { LLVM.transforms = [ LLVM.PromoteMemoryToRegister ]
+      }
 
 -- | The name of the brainfuck \"main\" function in the LLVM IR.
 bfmain :: AST.Name
