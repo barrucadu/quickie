@@ -386,9 +386,9 @@ llcompile code = AST.defaultModule
           -- in the mandelbrot program, so it's a good optimisation to
           -- do.
           initialise =
-            [ store dp (refp dp0)
-            , AST.mkName "dp0" .= AST.GetElementPtr True mem [cint8 0, cint8 0] []
-            , AST.mkName "dp"  .= AST.Alloca (ptr AST.i8) Nothing 0 []
+            [ store dp (refm16 dp0)
+            , AST.mkName "dp0" .= add (cint16 0) (cint16 0)
+            , AST.mkName "dp"  .= AST.Alloca AST.i16 Nothing 0 []
             ]
 
           -- here 'ops' is the operations of the final block
@@ -405,63 +405,75 @@ llcompile code = AST.defaultModule
     -- { %dpT' = add %dpT, w }
     gen (n, ops, dpT, bs) ip (GoR w) =
       let final = AST.mkName (show ip ++ ".F")
-          op = final .= add (refp (tname dpT)) (cint16 w)
+          op = final .= add (refm16 (tname dpT)) (cint16 w)
       in (n, op:ops, Dirty final, bs)
 
     -- { %dpT' = sub %dpT, w }
     gen (n, ops, dpT, bs) ip (GoL w) =
       let final = AST.mkName (show ip ++ ".F")
-          op = final .= sub (refp (tname dpT)) (cint16 w)
+          op = final .= sub (refm16 (tname dpT)) (cint16 w)
       in (n, op:ops, Dirty final, bs)
 
-    -- { %tmp1 = load %dpT; %tmp2 = add %tmp1, w; store %dpT, %tmp2 }
+    -- { %tmpP = gep mem [0, %dpT]; %tmp1 = load %tmpP; %tmp2 = add %tmp1, w; store %tmpP, %tmp2 }
     gen (n, ops, dpT, bs) ip (Inc w) =
-      let tmp1 = AST.mkName (show ip ++ ".T1")
+      let tmpP = AST.mkName (show ip ++ ".P")
+          tmp1 = AST.mkName (show ip ++ ".T1")
           tmp2 = AST.mkName (show ip ++ ".T2")
           ops' =
-            [ store (refp (tname dpT)) (refm tmp2)
+            [ store (refp tmpP) (refm tmp2)
             , tmp2 .= add (refm tmp1) (cint8 w)
-            , tmp1 .= load (refp (tname dpT))
+            , tmp1 .= load (refp tmpP)
+            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
             ] ++ ops
       in (n, ops', dpT, bs)
 
-    -- { %tmp1 = load %dpT; %tmp2 = sub %tmp1, w; store %dpT, %tmp2 }
+    -- { %tmpP = gep mem [0, %dpT]; %tmp1 = load %tmpP; %tmp2 = sub %tmp1, w; store %tmpP, %tmp2 }
     gen (n, ops, dpT, bs) ip (Dec w) =
-      let tmp1 = AST.mkName (show ip ++ ".T1")
+      let tmpP = AST.mkName (show ip ++ ".P")
+          tmp1 = AST.mkName (show ip ++ ".T1")
           tmp2 = AST.mkName (show ip ++ ".T2")
           ops' =
-            [ store (refp (tname dpT)) (refm tmp2)
+            [ store (refp tmpP) (refm tmp2)
             , tmp2 .= sub (refm tmp1) (cint8 w)
-            , tmp1 .= load (refp (tname dpT))
+            , tmp1 .= load (refp tmpP)
+            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
             ] ++ ops
       in (n, ops', dpT, bs)
 
-    -- { store %dpT, w }
-    gen (n, ops, dpT, bs) _ (Set w) =
-      let op = store (refp (tname dpT)) (cint8 w)
-      in (n, op:ops, dpT, bs)
+    -- { %tmpP = gep mem [0, %dpT]; store %tmpP, w }
+    gen (n, ops, dpT, bs) ip (Set w) =
+      let tmpP = AST.mkName (show ip ++ ".P")
+          ops' =
+            [ store (refp tmpP) (cint8 w)
+            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
+            ] ++ ops
+      in (n, ops', dpT, bs)
 
-    -- { %tmp1 = load %dpT; %tmp2 = icmp eq 0, %tmp1; cbr %tmp2, TRUE, FALSE }
+    -- { %tmpP = gep mem [0, %d[T]; %tmp1 = load %tmpP; %tmp2 = icmp eq 0, %tmp1; cbr %tmp2, TRUE, FALSE }
     gen (n, ops, dpT, bs) ip (JZ a) = jmp n ops dpT bs ip (show a) (show ip)
 
-    -- { %tmp1 = load %dpT; %tmp2 = icmp eq 0, %tmp1; cbr %tmp2, FALSE, TRUE }
+    -- { %tmpP = gep mem [0, %d[T]; %tmp1 = load %tmpP; %tmp2 = icmp eq 0, %tmp1; cbr %tmp2, FALSE, TRUE }
     gen (n, ops, dpT, bs) ip (JNZ a) = jmp n ops dpT bs ip (show ip) (show a)
 
-    -- { %tmp = load %dpT; call "putchar" %tmp }
+    -- { %tmpP = gep mem [0, %dpT]; %tmp1 = load %tmpP; call "putchar" %tmp1 }
     gen (n, ops, dpT, bs) ip PutCh =
-      let tmp = AST.mkName (show ip ++ ".T")
+      let tmpP = AST.mkName (show ip ++ ".P")
+          tmp1 = AST.mkName (show ip ++ ".T1")
           ops' =
-            [ AST.Do (call (gname AST.i32 putchar) [refm tmp])
-            , tmp .= load (refp (tname dpT))
+            [ AST.Do (call (gname AST.i32 putchar) [refm tmp1])
+            , tmp1 .= load (refp tmpP)
+            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
             ] ++ ops
       in (n, ops', dpT, bs)
 
-    -- { %tmp = call "getchar"; store %dpT, %tmp }
+    -- { %tmpP = gep mem [0, %dpT]; %tmp1 = call "getchar"; store %tmpP, %tmp1 }
     gen (n, ops, dpT, bs) ip GetCh =
-      let tmp = AST.mkName (show ip ++ ".T")
+      let tmpP = AST.mkName (show ip ++ ".P")
+          tmp1 = AST.mkName (show ip ++ ".T1")
           ops' =
-            [ store (refp (tname dpT)) (refm tmp)
-            , tmp .= call (gname AST.i32 getchar) []
+            [ store (refp tmpP) (refm tmp1)
+            , tmp1 .= call (gname AST.i32 getchar) []
+            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
             ] ++ ops
       in (n, ops', dpT, bs)
 
@@ -478,6 +490,9 @@ llcompile code = AST.defaultModule
 
     -- reference to an i8
     refm = AST.LocalReference AST.i8
+
+    -- reference to an i16
+    refm16 = AST.LocalReference AST.i16
 
     -- reference to a *i8
     refp = AST.LocalReference (ptr AST.i8)
@@ -499,7 +514,7 @@ llcompile code = AST.defaultModule
     cint16 = AST.ConstantOperand . ASTC.Int 16 . (fromIntegral :: W.Word16 -> Integer)
 
     -- the data pointer
-    dp = AST.LocalReference (ptr AST.i8) (AST.mkName "dp")
+    dp = AST.LocalReference (ptr AST.i16) (AST.mkName "dp")
 
     -- the global memory
     mem = AST.ConstantOperand $
@@ -508,16 +523,18 @@ llcompile code = AST.defaultModule
     -- a helper for 'JZ' / 'JNZ', as they use the same comparison but
     -- just swap the true and false cases
     jmp n ops dpT bs ip true false =
-      let tmp1 = AST.mkName (show ip ++ ".T1")
+      let tmpP = AST.mkName (show ip ++ ".P")
+          tmp1 = AST.mkName (show ip ++ ".T1")
           tmp2 = AST.mkName (show ip ++ ".T2")
           dp0  = AST.mkName ("dp" ++ show ip)
           storedp = case dpT of
             Clean _ -> []
-            Dirty _ -> [store dp (refp (tname dpT))]
+            Dirty _ -> [store dp (refm16 (tname dpT))]
           term = AST.CondBr (refb tmp2) (AST.mkName true) (AST.mkName false) []
           ops' =
             [ tmp2 .= AST.ICmp AST.EQ (cint8 0) (refm tmp1) []
-            , tmp1 .= load (refp (tname dpT))
+            , tmp1 .= load (refp tmpP)
+            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
             ] ++ storedp ++ ops
           b = block n ops' term
       in (AST.mkName (show ip), [dp0 .= load dp], Clean dp0, b : bs)
@@ -577,6 +594,10 @@ extern name ptys rty = AST.GlobalDefinition AST.functionDefaults
   , AST.parameters  = ([AST.Parameter ty (AST.mkName "") [] | ty <- ptys], False)
   , AST.returnType  = rty
   }
+
+-- | Get a pointer to a substructure of a larger structure
+gep :: AST.Operand -> [AST.Operand] -> AST.Instruction
+gep tgt idxs = AST.GetElementPtr True tgt idxs []
 
 -- | Load a value from an address.
 load :: AST.Operand -> AST.Instruction
