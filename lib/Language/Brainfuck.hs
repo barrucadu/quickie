@@ -6,6 +6,7 @@
 -- | The Quickie Brainfuck parser and compiler.
 module Language.Brainfuck where
 
+import           Control.Arrow (first)
 import           Data.Bits ((.|.), (.&.), unsafeShiftL, unsafeShiftR)
 import qualified Data.ByteString.Char8 as BS
 import           Data.Char (chr, ord)
@@ -41,8 +42,9 @@ import           Text.Printf (printf)
 -- bits:
 --
 -- * 4 bit opcode
--- * 16 bit operand
--- * 12 bits unused
+-- * 16 bit unsigned data pointer offset
+-- * 8 bit operand
+-- * 4 bits unused
 --
 -- Well-formed instructions are those constructed by the pattern
 -- synonyms.  Any other instruction is ill-formed and may lead to a
@@ -67,44 +69,54 @@ type IR = V.Vector Instruction
 --
 -- The operand is how far to move by.
 pattern GoR :: W.Word16 -> Instruction
-pattern GoR w <- (unpack16 -> (0, w)) where GoR w = pack 0 w
+pattern GoR w <- (unpack -> (0, w, _)) where GoR w = pack 0 w 0
 
 -- | Move the data pointer to the \"left\" (beginning) of the memory
 -- array.
 --
 -- The operand is how far to move by.
 pattern GoL :: W.Word16 -> Instruction
-pattern GoL w <- (unpack16 -> (1, w)) where GoL w = pack 1 w
+pattern GoL w <- (unpack -> (1, w, _)) where GoL w = pack 1 w 0
 
 -- | Increment (with wrapping) the value under the data pointer.
 --
 -- The operand is how much to increment by.
 pattern Inc :: W.Word8 -> Instruction
-pattern Inc w <- (unpack8 -> (2, w)) where Inc w = pack 2 w
+pattern Inc w <- (unpack -> (2, _, w)) where Inc w = pack 2 0 w
 
 -- | Decrement (with wrapping) the value under the data pointer.
 --
 -- The operand is how much to decrement by.
 pattern Dec :: W.Word8 -> Instruction
-pattern Dec w <- (unpack8 -> (3, w)) where Dec w = pack 3 w
+pattern Dec w <- (unpack -> (3, _, w)) where Dec w = pack 3 0 w
 
 -- | Set the value under the data pointer to a constant.
 --
 -- The operand is the value to set.
 pattern Set :: W.Word8 -> Instruction
-pattern Set w <- (unpack8 -> (4, w)) where Set w = pack 4 w
+pattern Set w <- (unpack -> (4, _, w)) where Set w = pack 4 0 w
+
+-- | Add the value of the current cell to another (given by dp offset
+-- to the right) with a multiplier.
+pattern CMulR :: W.Word16 -> W.Word8 -> Instruction
+pattern CMulR a w <- (unpack -> (10, a, w)) where CMulR a w = pack 10 a w
+
+-- | Add the value of the current cell to another (given by dp offset
+-- to the left) with a multiplier.
+pattern CMulL :: W.Word16 -> W.Word8 -> Instruction
+pattern CMulL a w <- (unpack -> (11, a, w)) where CMulL a w = pack 11 a w
 
 -- | Jump if the value under the data pointer is zero.
 --
 -- The operand is the address to jump to.
 pattern JZ :: W.Word16 -> Instruction
-pattern JZ a <- (unpack16 -> (5, a)) where JZ a = pack 5 a
+pattern JZ a <- (unpack -> (5, a, _)) where JZ a = pack 5 a 0
 
 -- | Jump if the value under the data pointer is nonzero.
 --
 -- The operand is the address to jump to.
 pattern JNZ :: W.Word16 -> Instruction
-pattern JNZ a <- (unpack16 -> (6, a)) where JNZ a = pack 6 a
+pattern JNZ a <- (unpack -> (6, a, _)) where JNZ a = pack 6 a 0
 
 -- | Print the value under the data pointer as an ASCII character
 -- code.
@@ -160,6 +172,20 @@ interpret code = run' =<< VM.replicate memSize 0 where
         VM.unsafeWrite mem dp w
         go (ip+1) dp
 
+      -- mem[dp+a] = mem[dp+a] + mem[dp] * i
+      CMulR a w -> do
+        let dp' = dp + fromIntegral a
+        x <- VM.unsafeRead mem dp
+        VM.unsafeModify mem (\y -> y + x * w) (if dp' >= memSize then memSize-1 else dp')
+        go (ip+1) dp
+
+      -- mem[dp-a] = mem[dp-a] + mem[dp] * i
+      CMulL a w -> do
+        let dp' = dp - fromIntegral a
+        x <- VM.unsafeRead mem dp
+        VM.unsafeModify mem (\y -> y + x * w) (if dp' < 0 then 0 else dp')
+        go (ip+1) dp
+
       -- ip = ((mem[dp] == 0 ? a : ip) + 1)
       JZ a -> do
         w <- VM.unsafeRead mem dp
@@ -186,7 +212,7 @@ interpret code = run' =<< VM.replicate memSize 0 where
       Hlt -> pure ()
 
       -- unreachable if the IR is well-formed
-      instr -> error ("invalid opcode: " ++ show (fst (unpack8 instr)))
+      instr -> error ("invalid opcode: " ++ show (instr .&. 255))
 
 -- | JIT compile and execute an LLVM IR program.
 jit :: AST.Module -> IO ()
@@ -221,12 +247,14 @@ dumpir mfname ir = do
         Inc w -> prn ("Inc  " ++ show w) >> pure lvl
         Dec w -> prn ("Dec  " ++ show w) >> pure lvl
         Set w -> prn ("Set  " ++ show w) >> pure lvl
+        CMulR a w -> prn ("CMulR @" ++ show a ++ " " ++ show w) >> pure lvl
+        CMulL a w -> prn ("CMulL @" ++ show a ++ " " ++ show w) >> pure lvl
         JZ  a -> prn ("JZ  @" ++ show a) >> pure (lvl + 1)
         JNZ a -> prn ("JNZ @" ++ show a) >> pure (lvl - 1)
         PutCh -> prn "PutCh" >> pure lvl
         GetCh -> prn "GetCh" >> pure lvl
         Hlt   -> prn "Hlt" >> pure lvl
-        _     -> error ("invalid opcode: " ++ show (fst (unpack8 instr)))
+        _     -> error ("invalid opcode: " ++ show (instr .&. 255))
 
 -- | Dump the LLVM IR to stdout or a file.
 dumpllvm :: Maybe String -> AST.Module -> IO ()
@@ -267,7 +295,7 @@ compile s0 = V.create (compile' (filter isbf s0)) where
     go vcode 0 chunkSize [] scode
 
   -- if there's no space left, grow the vector
-  go vcode ip 0 stk cs = do
+  go vcode ip sz stk cs | sz < 2 = do
     vcode' <- VM.unsafeGrow vcode chunkSize
     go vcode' ip chunkSize stk cs
 
@@ -287,9 +315,12 @@ compile s0 = V.create (compile' (filter isbf s0)) where
     let
       -- push an instruction with no operand into the vector and
       -- continue with the later instructions
-      pushi instr = do
+      pushi instr = pushi' instr cs
+
+      -- pushi, but takes the instruction sequence to continue from
+      pushi' instr rest = do
         VM.unsafeWrite vcode ip instr
-        go vcode (ip+1) (sz-1) stk cs
+        go vcode (ip+1) (sz-1) stk rest
 
       -- push an instruction into the vector, where the operand is the
       -- number of times the current instruction occurs (run-length
@@ -299,6 +330,42 @@ compile s0 = V.create (compile' (filter isbf s0)) where
         let (eqs, rest) = span (==c) cs
         VM.unsafeWrite vcode ip (instr (1 + fromIntegral (length eqs)))
         go vcode (ip+1) (sz-1) stk rest
+
+      -- see if a loop body corresponds to a known pattern
+      loop l0 = case l0 of
+        -- "[-]" and "[+]" zero the cell
+        ('-':']':rest) -> pushi' (Set 0) rest
+        ('+':']':rest) -> pushi' (Set 0) rest
+        -- "[-{>m}{+n}{<m}]" zeroes the cell and adds n * its value to
+        -- the cell m to the right
+        ('-':'>':rest) -> case first length (span (=='>') rest) of
+          (m1, '+':rest') -> case first length (span (=='+') rest') of
+            (n, '<':rest'') -> case first length (span (=='<') rest'') of
+              (m2, ']':rest''') | m1 == m2 -> do
+                VM.unsafeWrite vcode ip (CMulR (1 + fromIntegral m1) (1 + fromIntegral n))
+                VM.unsafeWrite vcode (ip+1) (Set 0)
+                go vcode (ip+2) (sz-2) stk rest'''
+              _ -> defloop l0
+            _ -> defloop l0
+          _ -> defloop l0
+        -- "[-{<m}{+n}{>m}]" zeroes the cell and adds n * its value to
+        -- the cell m to the left
+        ('-':'<':rest) -> case first length (span (=='<') rest) of
+          (m1, '+':rest') -> case first length (span (=='+') rest') of
+            (n, '>':rest'') -> case first length (span (=='>') rest'') of
+              (m2, ']':rest''') | m1 == m2 -> do
+                VM.unsafeWrite vcode ip (CMulL (1 + fromIntegral m1) (1 + fromIntegral n))
+                VM.unsafeWrite vcode (ip+1) (Set 0)
+                go vcode (ip+2) (sz-2) stk rest'''
+              _ -> defloop l0
+            _ -> defloop l0
+          _ -> defloop l0
+        _ -> defloop l0
+
+      -- a regular loop starter
+      defloop rest = do
+        VM.unsafeWrite vcode ip Hlt
+        go vcode (ip+1) (sz-1) (ip:stk) rest
     in case c of
          '>' -> pushir GoR
          '<' -> pushir GoL
@@ -306,19 +373,7 @@ compile s0 = V.create (compile' (filter isbf s0)) where
          '-' -> pushir Dec
          '.' -> pushi PutCh
          ',' -> pushi GetCh
-         '[' -> case cs of
-           -- compile "[-]" and "[+]" to a @Set 0@ instruction
-           ('-':']':cs') -> do
-             VM.unsafeWrite vcode ip (Set 0)
-             go vcode (ip+1) (sz-1) stk cs'
-           ('+':']':cs') -> do
-             VM.unsafeWrite vcode ip (Set 0)
-             go vcode (ip+1) (sz-1) stk cs'
-           -- otherwise, write a 'Hlt' for now and push the ip to the
-           -- stack
-           _ -> do
-             VM.unsafeWrite vcode ip Hlt
-             go vcode (ip+1) (sz-1) (ip:stk) cs
+         '[' -> loop cs
          ']' -> case stk of
            -- replace the "[" (which was compiled to a 'Hlt') with a
            -- @JZ <here>@, write a @JNZ <there>@, and pop the stack;
@@ -406,45 +461,52 @@ llcompile code = AST.defaultModule
     -- order) list of previous blocks (with the instructions of each
     -- in the correct order).
 
-    -- { %dpT' = add %dpT, w }
+    -- %dpT' = add %dpT, w
     gen (n, ops, dpT, bs) ip (GoR w) =
       let final = AST.mkName (show ip ++ ".F")
           op = final .= add (refm16 (tname dpT)) (cint16 w)
       in (n, op:ops, Dirty final, bs)
 
-    -- { %dpT' = sub %dpT, w }
+    -- %dpT' = sub %dpT, w
     gen (n, ops, dpT, bs) ip (GoL w) =
       let final = AST.mkName (show ip ++ ".F")
           op = final .= sub (refm16 (tname dpT)) (cint16 w)
       in (n, op:ops, Dirty final, bs)
 
-    -- { %tmpP = gep mem [0, %dpT]; %tmp1 = load %tmpP; %tmp2 = add %tmp1, w; store %tmpP, %tmp2 }
-    gen (n, ops, dpT, bs) ip (Inc w) =
-      let tmpP = AST.mkName (show ip ++ ".P")
-          tmp1 = AST.mkName (show ip ++ ".T1")
-          tmp2 = AST.mkName (show ip ++ ".T2")
-          ops' =
-            [ store (refp tmpP) (refm tmp2)
-            , tmp2 .= add (refm tmp1) (cint8 w)
-            , tmp1 .= load (refp tmpP)
-            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
-            ] ++ ops
-      in (n, ops', dpT, bs)
+    -- %tmpP = gep mem [0, %dpT]
+    -- %tmp1 = load %tmpP
+    -- %tmp2 = add %tmp1, w
+    -- store %tmpP, %tmp2
+    gen (n, ops, dpT, bs) ip (Inc w) = incdec n ops dpT bs ip w add
 
-    -- { %tmpP = gep mem [0, %dpT]; %tmp1 = load %tmpP; %tmp2 = sub %tmp1, w; store %tmpP, %tmp2 }
-    gen (n, ops, dpT, bs) ip (Dec w) =
-      let tmpP = AST.mkName (show ip ++ ".P")
-          tmp1 = AST.mkName (show ip ++ ".T1")
-          tmp2 = AST.mkName (show ip ++ ".T2")
-          ops' =
-            [ store (refp tmpP) (refm tmp2)
-            , tmp2 .= sub (refm tmp1) (cint8 w)
-            , tmp1 .= load (refp tmpP)
-            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
-            ] ++ ops
-      in (n, ops', dpT, bs)
+    -- %tmpP = gep mem [0, %dpT]
+    -- %tmp1 = load %tmpP
+    -- %tmp2 = sub %tmp1, w
+    -- store %tmpP, %tmp2
+    gen (n, ops, dpT, bs) ip (Dec w) = incdec n ops dpT bs ip w sub
 
-    -- { %tmpP = gep mem [0, %dpT]; store %tmpP, w }
+    -- %tmpP = gep mem [0, %dpT]
+    -- %tmp1 = load %tmpP
+    -- %tmp2 = mul %tmp1, w
+    -- %tmp3 = add %gpT, a
+    -- %tmp4 = gep mem [0, %tmp3]
+    -- %tmp5 = load %tmp4
+    -- %tmp6 = add %tmp5, %tmp2
+    -- store %tmp4, %tmp6
+    gen (n, ops, dpT, bs) ip (CMulR a w) = cmul n ops dpT bs ip a w add
+
+    -- %tmpP = gep mem [0, %dpT]
+    -- %tmp1 = load %tmpP
+    -- %tmp2 = mul %tmp1, w
+    -- %tmp3 = add %gpT, a
+    -- %tmp4 = gep mem [0, %tmp3]
+    -- %tmp5 = load %tmp4
+    -- %tmp6 = add %tmp5, %tmp2
+    -- store %tmp4, %tmp6
+    gen (n, ops, dpT, bs) ip (CMulL a w) = cmul n ops dpT bs ip a w sub
+
+    -- %tmpP = gep mem [0, %dpT]
+    -- store %tmpP, w
     gen (n, ops, dpT, bs) ip (Set w) =
       let tmpP = AST.mkName (show ip ++ ".P")
           ops' =
@@ -453,13 +515,21 @@ llcompile code = AST.defaultModule
             ] ++ ops
       in (n, ops', dpT, bs)
 
-    -- { %tmpP = gep mem [0, %d[T]; %tmp1 = load %tmpP; %tmp2 = icmp eq 0, %tmp1; cbr %tmp2, TRUE, FALSE }
+    -- %tmpP = gep mem [0, %dpT]
+    -- %tmp1 = load %tmpP
+    -- %tmp2 = icmp eq 0, %tmp1
+    -- cbr %tmp2, TRUE, FALSE
     gen (n, ops, dpT, bs) ip (JZ a) = jmp n ops dpT bs ip (show a) (show ip)
 
-    -- { %tmpP = gep mem [0, %d[T]; %tmp1 = load %tmpP; %tmp2 = icmp eq 0, %tmp1; cbr %tmp2, FALSE, TRUE }
+    -- %tmpP = gep mem [0, %dpT]
+    -- %tmp1 = load %tmpP
+    -- %tmp2 = icmp eq 0, %tmp1
+    -- cbr %tmp2, FALSE, TRUE
     gen (n, ops, dpT, bs) ip (JNZ a) = jmp n ops dpT bs ip (show ip) (show a)
 
-    -- { %tmpP = gep mem [0, %dpT]; %tmp1 = load %tmpP; call "putchar" %tmp1 }
+    -- %tmpP = gep mem [0, %dpT]
+    -- %tmp1 = load %tmpP
+    -- call "putchar" %tmp1
     gen (n, ops, dpT, bs) ip PutCh =
       let tmpP = AST.mkName (show ip ++ ".P")
           tmp1 = AST.mkName (show ip ++ ".T1")
@@ -470,7 +540,9 @@ llcompile code = AST.defaultModule
             ] ++ ops
       in (n, ops', dpT, bs)
 
-    -- { %tmpP = gep mem [0, %dpT]; %tmp1 = call "getchar"; store %tmpP, %tmp1 }
+    -- %tmpP = gep mem [0, %dpT]
+    -- %tmp1 = call "getchar"
+    -- store %tmpP, %tmp1
     gen (n, ops, dpT, bs) ip GetCh =
       let tmpP = AST.mkName (show ip ++ ".P")
           tmp1 = AST.mkName (show ip ++ ".T1")
@@ -481,13 +553,13 @@ llcompile code = AST.defaultModule
             ] ++ ops
       in (n, ops', dpT, bs)
 
-    -- { ret }
+    -- ret
     gen (n, ops, dpT, bs) ip Hlt =
       let b = block n ops (AST.Ret Nothing [])
       in (AST.mkName (show ip), [], dpT, b : bs)
 
     -- unreachable if the IR is well-formed
-    gen _ _ instr = error ("invalid opcode: " ++ show (fst (unpack8 instr)))
+    gen _ _ instr = error ("invalid opcode: " ++ show (instr .&. 255))
 
     -- reference to an external name
     gname ty = AST.ConstantOperand . ASTC.GlobalReference ty
@@ -524,6 +596,42 @@ llcompile code = AST.defaultModule
     mem = AST.ConstantOperand $
       ASTC.GlobalReference (AST.ArrayType (fromIntegral memSize) AST.i8) (AST.mkName "mem")
 
+    -- a helper for 'Inc' / 'Dec', as they use the same logic but
+    -- differ in the arithmetic instruction used
+    incdec n ops dpT bs ip w llop =
+      let tmpP = AST.mkName (show ip ++ ".P")
+          tmp1 = AST.mkName (show ip ++ ".T1")
+          tmp2 = AST.mkName (show ip ++ ".T2")
+          ops' =
+            [ store (refp tmpP) (refm tmp2)
+            , tmp2 .= llop (refm tmp1) (cint8 w)
+            , tmp1 .= load (refp tmpP)
+            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
+            ] ++ ops
+      in (n, ops', dpT, bs)
+
+    -- a helper for 'CMulR' / 'CMulL', as they use the same logic but
+    -- differ in the direction of pointer movement
+    cmul n ops dpT bs ip a w llop =
+      let tmpP = AST.mkName (show ip ++ ".P")
+          tmp1 = AST.mkName (show ip ++ ".T1")
+          tmp2 = AST.mkName (show ip ++ ".T2")
+          tmp3 = AST.mkName (show ip ++ ".T3")
+          tmp4 = AST.mkName (show ip ++ ".T4")
+          tmp5 = AST.mkName (show ip ++ ".T5")
+          tmp6 = AST.mkName (show ip ++ ".T6")
+          ops' =
+            [ store (refp tmp4) (refm tmp6)
+            , tmp6 .= add (refm tmp5) (refm tmp2)
+            , tmp5 .= load (refp tmp4)
+            , tmp4 .= gep mem [cint8 0, refm16 tmp3]
+            , tmp3 .= llop (refm16 (tname dpT)) (cint16 a)
+            , tmp2 .= mul (refm tmp1) (cint8 w)
+            , tmp1 .= load (refp tmpP)
+            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
+            ] ++ ops
+      in (n, ops', dpT, bs)
+
     -- a helper for 'JZ' / 'JNZ', as they use the same comparison but
     -- just swap the true and false cases
     jmp n ops dpT bs ip true false =
@@ -550,16 +658,12 @@ llcompile code = AST.defaultModule
 -- | Pack an instruction from its components.
 --
 -- You should not use this directly.
-pack :: Integral i => W.Word32 -> i -> Instruction
-pack op arg = op .|. unsafeShiftL (fromIntegral arg) 4
+pack :: W.Word32 -> W.Word16 -> W.Word8 -> Instruction
+pack op arg1 arg2 = op .|. unsafeShiftL (fromIntegral arg1) 4 .|. unsafeShiftL (fromIntegral arg2) 20
 
--- | Unpack an instruction into an opcode and an 8-bit argument.
-unpack8 :: Instruction -> (W.Word32, W.Word8)
-unpack8 instr = (instr .&. 15, fromIntegral (unsafeShiftR instr 4 .&. 255))
-
--- | Unpack an instruction into an opcode and a 16-bit argument.
-unpack16 :: Instruction -> (W.Word32, W.Word16)
-unpack16 instr = (instr .&. 15, fromIntegral (unsafeShiftR instr 4 .&. 65535))
+-- | Unpack an instruction which has two operands.
+unpack :: Instruction -> (W.Word32, W.Word16, W.Word8)
+unpack instr = (instr .&. 15, fromIntegral (unsafeShiftR instr 4 .&. 65535), fromIntegral (unsafeShiftR instr 20 .&. 255))
 
 -- | Run an LLVM operation on a module.
 runLLVM :: Bool -> (LLVM.TargetMachine -> LLVM.Context -> LLVM.Module -> IO ()) -> AST.Module -> IO ()
@@ -623,6 +727,10 @@ add op1 op2 = AST.Add False False op1 op2 []
 -- | Integer subtraction.
 sub :: AST.Operand -> AST.Operand -> AST.Instruction
 sub op1 op2 = AST.Sub False False op1 op2 []
+
+-- | Integer multiplication.
+mul :: AST.Operand -> AST.Operand -> AST.Instruction
+mul op1 op2 = AST.Mul False False op1 op2 []
 
 -- | Call a function.
 call :: AST.Operand -> [AST.Operand] -> AST.Instruction
