@@ -9,12 +9,18 @@ module Language.Brainfuck where
 import           Data.Bits ((.|.), (.&.), unsafeShiftL, unsafeShiftR)
 import qualified Data.ByteString.Char8 as BS
 import           Data.Char (chr, ord)
-import           Data.String (fromString)
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as VM
 import qualified Data.Word as W
 import           Foreign.Ptr (FunPtr, castFunPtr)
-import qualified LLVM.AST as AST
+import qualified LLVM.AST as AST hiding (type')
+import qualified LLVM.AST.AddrSpace as AST
+import qualified LLVM.AST.CallingConvention as AST
+import qualified LLVM.AST.Constant as ASTC
+import qualified LLVM.AST.Global as AST
+import qualified LLVM.AST.IntegerPredicate as AST
+import qualified LLVM.AST.Linkage as AST
+import qualified LLVM.AST.Type as AST
 import qualified LLVM.Context as LLVM
 import qualified LLVM.ExecutionEngine as LLVM
 import qualified LLVM.Module as LLVM
@@ -321,7 +327,191 @@ compile s0 = V.create (compile' (filter isbf s0)) where
 
 -- | Compile a Quickie IR program to LLVM IR.
 llcompile :: IR -> AST.Module
-llcompile = error "llcompile: unimplemented"
+llcompile code = AST.defaultModule
+    { AST.moduleDefinitions =
+      [ -- the main function (name must match what the JIT calls)
+        AST.GlobalDefinition AST.functionDefaults
+        { AST.name        = bfmain
+        , AST.parameters  = ([], False)
+        , AST.returnType  = AST.void
+        , AST.basicBlocks = blocks
+        }
+
+        -- the memory array, zero initialised
+      , AST.GlobalDefinition AST.globalVariableDefaults
+        { AST.name        = AST.mkName "mem"
+        , AST.linkage     = AST.Internal
+        , AST.isConstant  = False
+        , AST.initializer = Just (ASTC.Array AST.i8 (replicate memSize (ASTC.Int 8 0)))
+        , AST.type'       = AST.ArrayType (fromIntegral memSize) AST.i8
+        }
+
+        -- library functions
+      , extern getchar []        AST.i32
+      , extern putchar [AST.i32] AST.i32
+      ]
+    }
+  where
+    -- an LLVM function consists of a sequence of "basic blocks",
+    -- where a basic block is a sequence of instructions followed by a
+    -- single terminator.  jumping to or from the middle of a basic
+    -- block is not possible.
+    blocks =
+      let dp0 = AST.mkName "dp0"
+          -- we're going to construct the sequence of instructions of
+          -- a basic block in reverse, as prepending to a list is
+          -- efficient; but then the list must be reversed when a
+          -- block is completed
+          --
+          -- LLVM does mutable state by pointers; local variables are
+          -- immutable.  so we're going to store the data pointer
+          -- behind a pointer (so a value of type **i8) and load/store
+          -- it when necessary; but in the simple case that leads to a
+          -- lot of loads and stores as every instruction uses the
+          -- cell the data pointer points to.  we can reduce these
+          -- loads and stores by keeping around the data pointer in an
+          -- immutable variable, creating a fresh variable every time
+          -- we do a 'GoL' or 'GoR'; then we just load it once at the
+          -- start of a basic block and store it once (if it changed
+          -- at all!) at the end.  this saves about 3000 loads/stores
+          -- in the mandelbrot program, so it's a good optimisation to
+          -- do.
+          initialise =
+            [ store dp (refp dp0)
+            , AST.mkName "dp0" .= AST.GetElementPtr True mem [cint8 0, cint8 0] []
+            , AST.mkName "dp"  .= AST.Alloca (ptr AST.i8) Nothing 0 []
+            ]
+
+          -- here 'ops' is the operations of the final block
+          (n, ops, _, bs) = V.ifoldl' gen (AST.mkName "entry", initialise, Clean dp0, []) code
+      in reverse (block n ops ret:bs)
+
+    -- generate code, the arguments are: 'n', the name of the current
+    -- basic block; 'ops', the (reverse order) list of instructions in
+    -- the current basic block; 'dpT', the name of the immutable
+    -- variable currently holding the data pointer; 'bs', the (reverse
+    -- order) list of previous blocks (with the instructions of each
+    -- in the correct order).
+
+    -- { %dpT' = add %dpT, w }
+    gen (n, ops, dpT, bs) ip (GoR w) =
+      let final = AST.mkName (show ip ++ ".F")
+          op = final .= add (refp (tname dpT)) (cint16 w)
+      in (n, op:ops, Dirty final, bs)
+
+    -- { %dpT' = sub %dpT, w }
+    gen (n, ops, dpT, bs) ip (GoL w) =
+      let final = AST.mkName (show ip ++ ".F")
+          op = final .= sub (refp (tname dpT)) (cint16 w)
+      in (n, op:ops, Dirty final, bs)
+
+    -- { %tmp1 = load %dpT; %tmp2 = add %tmp1, w; store %dpT, %tmp2 }
+    gen (n, ops, dpT, bs) ip (Inc w) =
+      let tmp1 = AST.mkName (show ip ++ ".T1")
+          tmp2 = AST.mkName (show ip ++ ".T2")
+          ops' =
+            [ store (refp (tname dpT)) (refm tmp2)
+            , tmp2 .= add (refm tmp1) (cint8 w)
+            , tmp1 .= load (refp (tname dpT))
+            ] ++ ops
+      in (n, ops', dpT, bs)
+
+    -- { %tmp1 = load %dpT; %tmp2 = sub %tmp1, w; store %dpT, %tmp2 }
+    gen (n, ops, dpT, bs) ip (Dec w) =
+      let tmp1 = AST.mkName (show ip ++ ".T1")
+          tmp2 = AST.mkName (show ip ++ ".T2")
+          ops' =
+            [ store (refp (tname dpT)) (refm tmp2)
+            , tmp2 .= sub (refm tmp1) (cint8 w)
+            , tmp1 .= load (refp (tname dpT))
+            ] ++ ops
+      in (n, ops', dpT, bs)
+
+    -- { store %dpT, w }
+    gen (n, ops, dpT, bs) _ (Set w) =
+      let op = store (refp (tname dpT)) (cint8 w)
+      in (n, op:ops, dpT, bs)
+
+    -- { %tmp1 = load %dpT; %tmp2 = icmp eq 0, %tmp1; cbr %tmp2, TRUE, FALSE }
+    gen (n, ops, dpT, bs) ip (JZ a) = jmp n ops dpT bs ip (show a) (show ip)
+
+    -- { %tmp1 = load %dpT; %tmp2 = icmp eq 0, %tmp1; cbr %tmp2, FALSE, TRUE }
+    gen (n, ops, dpT, bs) ip (JNZ a) = jmp n ops dpT bs ip (show ip) (show a)
+
+    -- { %tmp = load %dpT; call "putchar" %tmp }
+    gen (n, ops, dpT, bs) ip PutCh =
+      let tmp = AST.mkName (show ip ++ ".T")
+          ops' =
+            [ AST.Do (call (gname AST.i32 putchar) [refm tmp])
+            , tmp .= load (refp (tname dpT))
+            ] ++ ops
+      in (n, ops', dpT, bs)
+
+    -- { %tmp = call "getchar"; store %dpT, %tmp }
+    gen (n, ops, dpT, bs) ip GetCh =
+      let tmp = AST.mkName (show ip ++ ".T")
+          ops' =
+            [ store (refp (tname dpT)) (refm tmp)
+            , tmp .= call (gname AST.i32 getchar) []
+            ] ++ ops
+      in (n, ops', dpT, bs)
+
+    -- { ret }
+    gen (n, ops, dpT, bs) ip Hlt =
+      let b = block n ops ret
+      in (AST.mkName (show ip), [], dpT, b : bs)
+
+    -- unreachable if the IR is well-formed
+    gen _ _ instr = error ("invalid opcode: " ++ show (fst (unpack8 instr)))
+
+    -- reference to an external name
+    gname ty = AST.ConstantOperand . ASTC.GlobalReference ty
+
+    -- reference to an i8
+    refm = AST.LocalReference AST.i8
+
+    -- reference to a *i8
+    refp = AST.LocalReference (ptr AST.i8)
+
+    -- reference to a bool
+    refb = AST.LocalReference AST.i1
+
+    -- pointer type
+    ptr ty = AST.PointerType ty (AST.AddrSpace 0)
+
+    -- end a block
+    block n ops = AST.BasicBlock n (reverse ops) . AST.Do
+
+    -- store the result of an instruction
+    (.=) = (AST.:=)
+
+    -- constant ints
+    cint8  = AST.ConstantOperand . ASTC.Int 8  . (fromIntegral :: W.Word8  -> Integer)
+    cint16 = AST.ConstantOperand . ASTC.Int 16 . (fromIntegral :: W.Word16 -> Integer)
+
+    -- the data pointer
+    dp = AST.LocalReference (ptr AST.i8) (AST.mkName "dp")
+
+    -- the global memory
+    mem = AST.ConstantOperand $
+      ASTC.GlobalReference (AST.ArrayType (fromIntegral memSize) AST.i8) (AST.mkName "mem")
+
+    -- a helper for 'JZ' / 'JNZ', as they use the same comparison but
+    -- just swap the true and false cases
+    jmp n ops dpT bs ip true false =
+      let tmp1 = AST.mkName (show ip ++ ".T1")
+          tmp2 = AST.mkName (show ip ++ ".T2")
+          dp0  = AST.mkName ("dp" ++ show ip)
+          storedp = case dpT of
+            Clean _ -> []
+            Dirty _ -> [store dp (refp (tname dpT))]
+          term = AST.CondBr (refb tmp2) (AST.mkName true) (AST.mkName false) []
+          ops' =
+            [ tmp2 .= AST.ICmp AST.EQ (cint8 0) (refm tmp1) []
+            , tmp1 .= load (refp (tname dpT))
+            ] ++ storedp ++ ops
+          b = block n ops' term
+      in (AST.mkName (show ip), [dp0 .= load dp], Clean dp0, b : bs)
 
 
 -------------------------------------------------------------------------------
@@ -351,11 +541,57 @@ runLLVM f ast =
 
 -- | The name of the brainfuck \"main\" function in the LLVM IR.
 bfmain :: AST.Name
-bfmain = AST.Name (fromString "bfmain")
+bfmain = AST.mkName "bfmain"
+
+-- | The C putchar stdlib function.
+putchar :: AST.Name
+putchar = AST.mkName "putchar"
+
+-- | The C getchar stdlib function.
+getchar :: AST.Name
+getchar = AST.mkName "getchar"
 
 -- | The size of the heap
 memSize :: Int
 memSize = 30000
+
+-- | Keep track of whether a cached memory value is \"clean\"
+-- (unchanged since it was loaded) or \"dirty\" (changed and must be
+-- stored again).
+data Tagged = Clean { tname :: !AST.Name } | Dirty { tname :: !AST.Name }
+
+-- | An external binding
+extern :: AST.Name -> [AST.Type] -> AST.Type -> AST.Definition
+extern name ptys rty = AST.GlobalDefinition AST.functionDefaults
+  { AST.name        = name
+  , AST.linkage     = AST.External
+  , AST.parameters  = ([AST.Parameter ty (AST.mkName "") [] | ty <- ptys], False)
+  , AST.returnType  = rty
+  }
+
+-- | Load a value from an address.
+load :: AST.Operand -> AST.Instruction
+load ptr = AST.Load False ptr Nothing 0 []
+
+-- | Store a value to an address.
+store :: AST.Operand -> AST.Operand -> AST.Named AST.Instruction
+store ptr val = AST.Do $ AST.Store False ptr val Nothing 0 []
+
+-- | Integer addition.
+add :: AST.Operand -> AST.Operand -> AST.Instruction
+add op1 op2 = AST.Add False False op1 op2 []
+
+-- | Integer subtraction.
+sub :: AST.Operand -> AST.Operand -> AST.Instruction
+sub op1 op2 = AST.Sub False False op1 op2 []
+
+-- | Call a function.
+call :: AST.Operand -> [AST.Operand] -> AST.Instruction
+call fn args = AST.Call Nothing AST.C [] (Right fn) [(a, []) | a <- args] [] []
+
+-- | Return from the function.
+ret :: AST.Terminator
+ret = AST.Ret Nothing []
 
 -- | Plumbing to call the JIT-compiled code.
 foreign import ccall "dynamic" haskFun :: FunPtr (IO ()) -> IO ()
