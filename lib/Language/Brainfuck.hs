@@ -12,7 +12,9 @@ import           Data.Char (chr, ord)
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as VM
 import qualified Data.Word as W
+import           Control.Exception (try)
 import           Foreign.Ptr (FunPtr, castFunPtr)
+import qualified LLVM.Analysis as LLVM
 import qualified LLVM.AST as AST hiding (type')
 import qualified LLVM.AST.AddrSpace as AST
 import qualified LLVM.AST.CallingConvention as AST
@@ -23,6 +25,7 @@ import qualified LLVM.AST.Linkage as AST
 import qualified LLVM.AST.Type as AST
 import qualified LLVM.Context as LLVM
 import qualified LLVM.ExecutionEngine as LLVM
+import qualified LLVM.Exception as LLVM
 import qualified LLVM.Module as LLVM
 import qualified LLVM.Target as LLVM
 import           System.IO (IOMode(..), hPutStrLn, openFile, stdout)
@@ -235,6 +238,12 @@ dumpasm Nothing      = runLLVM $ \tgt _ m -> LLVM.moduleTargetAssembly tgt m >>=
 -- | Dump the LLVM-compiled object code to a file.
 objcompile :: String -> AST.Module -> IO ()
 objcompile fname = runLLVM $ \tgt _ m -> LLVM.writeObjectToFile tgt (LLVM.File fname) m
+
+-- | Run the LLVM verifier and print out the messages.
+verifyllvm :: AST.Module -> IO ()
+verifyllvm = runLLVM $ \_ _ m -> try (LLVM.verify m) >>= \case
+  Right () -> putStrLn "OK!"
+  Left (LLVM.VerifyException err) -> putStr err
 
 
 -------------------------------------------------------------------------------
