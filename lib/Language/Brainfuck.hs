@@ -394,9 +394,10 @@ llcompile code = AST.defaultModule
             , AST.mkName "dp"  .= AST.Alloca AST.i16 Nothing 0 []
             ]
 
-          -- here 'ops' is the operations of the final block
-          (n, ops, _, bs) = V.ifoldl' gen (AST.mkName "entry", initialise, Clean dp0, []) code
-      in reverse (block n ops ret:bs)
+          -- as long as the IR is well formed, the final block will
+          -- end with a ret and there will be no leftover instructions
+          (_, _, _, bs) = V.ifoldl' gen (AST.mkName "entry", initialise, Clean dp0, []) code
+      in reverse bs
 
     -- generate code, the arguments are: 'n', the name of the current
     -- basic block; 'ops', the (reverse order) list of instructions in
@@ -482,7 +483,7 @@ llcompile code = AST.defaultModule
 
     -- { ret }
     gen (n, ops, dpT, bs) ip Hlt =
-      let b = block n ops ret
+      let b = block n ops (AST.Ret Nothing [])
       in (AST.mkName (show ip), [], dpT, b : bs)
 
     -- unreachable if the IR is well-formed
@@ -626,10 +627,6 @@ sub op1 op2 = AST.Sub False False op1 op2 []
 -- | Call a function.
 call :: AST.Operand -> [AST.Operand] -> AST.Instruction
 call fn args = AST.Call Nothing AST.C [] (Right fn) [(a, []) | a <- args] [] []
-
--- | Return from the function.
-ret :: AST.Terminator
-ret = AST.Ret Nothing []
 
 -- | Plumbing to call the JIT-compiled code.
 foreign import ccall "dynamic" haskFun :: FunPtr (IO ()) -> IO ()
