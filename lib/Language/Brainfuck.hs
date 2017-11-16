@@ -16,6 +16,8 @@ import qualified LLVM.Context as LLVM
 import qualified LLVM.ExecutionEngine as LLVM
 import qualified LLVM.Module as LLVM
 import qualified LLVM.Target as LLVM
+import           System.IO (IOMode(..), hPutStrLn, openFile, stdout)
+import           Text.Printf (printf)
 
 -------------------------------------------------------------------------------
 -- * Quickie IR
@@ -134,7 +136,24 @@ jit =
 
 -- | Dump the Quickie IR to stdout or a file.
 dumpir :: Maybe String -> IR -> IO ()
-dumpir = error "dumpir: unimplemented"
+dumpir mfname ir = do
+    h <- maybe (pure stdout) (`openFile` WriteMode) mfname
+    V.ifoldM'_ (go h) 0 ir
+  where
+    go h lvl ip instr =
+      let prn = hPutStrLn h . printf "%.4d %s %s" ip (replicate lvl '\t')
+      in case instr of
+        GoR w -> prn ("GoR  " ++ show w) >> pure lvl
+        GoL w -> prn ("GoL  " ++ show w) >> pure lvl
+        Inc w -> prn ("Inc  " ++ show w) >> pure lvl
+        Dec w -> prn ("Dec  " ++ show w) >> pure lvl
+        Set w -> prn ("Set  " ++ show w) >> pure lvl
+        JZ  a -> prn ("JZ  @" ++ show a) >> pure (lvl + 1)
+        JNZ a -> prn ("JNZ @" ++ show a) >> pure (lvl - 1)
+        PutCh -> prn "PutCh" >> pure lvl
+        GetCh -> prn "GetCh" >> pure lvl
+        Hlt   -> prn "Hlt" >> pure lvl
+        _     -> error ("invalid opcode: " ++ show (fst (unpack8 instr)))
 
 -- | Dump the LLVM IR to stdout or a file.
 dumpllvm :: Maybe String -> AST.Module -> IO ()
