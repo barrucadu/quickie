@@ -8,6 +8,7 @@ module Language.Brainfuck where
 
 import           Data.Bits ((.|.), (.&.), unsafeShiftL, unsafeShiftR)
 import qualified Data.ByteString.Char8 as BS
+import           Data.Char (chr, ord)
 import           Data.String (fromString)
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as VM
@@ -115,7 +116,65 @@ pattern Hlt <- 9 where Hlt = 9
 --
 -- This will typically be slower than 'llcompile'ing and 'jit'ing it.
 interpret :: IR -> IO ()
-interpret = error "interpret: unimplemented"
+interpret code = run' =<< VM.replicate memSize 0 where
+  run' mem = go 0 0 where
+    -- to improve performance we use unsafe vector operations
+    -- everywhere, and do bounds checking only where necessary; in
+    -- particular, well-formed IR cannot have the ip go out of range,
+    -- so we can always unsafely index into the code
+    go !ip !dp = case V.unsafeIndex code ip of
+      -- dp = (dp + w), bounded to (memSize - 1)
+      GoR w ->
+        let dp' = dp + fromIntegral w
+        in go (ip+1) (if dp' >= memSize then memSize-1 else dp')
+
+      -- dp = (dp - w), bounded to 0
+      GoL w ->
+        let dp' = dp - fromIntegral w
+        in go (ip+1) (if dp' < 0 then 0 else dp')
+
+      -- mem[dp] = (mem[dp] + w), wrapping
+      Inc w -> do
+        VM.unsafeModify mem (+w) dp
+        go (ip+1) dp
+
+      -- mem[dp] = (mem[dp] - w), wrapping
+      Dec w -> do
+        VM.unsafeModify mem (subtract w) dp
+        go (ip+1) dp
+
+      -- mem[dp] = w
+      Set w -> do
+        VM.unsafeWrite mem dp w
+        go (ip+1) dp
+
+      -- ip = ((mem[dp] == 0 ? a : ip) + 1)
+      JZ a -> do
+        w <- VM.unsafeRead mem dp
+        go (if w == 0 then fromIntegral a + 1 else ip + 1) dp
+
+      -- ip = ((mem[dp] == 0 ? ip : a) + 1)
+      JNZ a -> do
+        w <- VM.unsafeRead mem dp
+        go (if w == 0 then ip + 1 else fromIntegral a + 1) dp
+
+      -- putchar(mem[dp])
+      PutCh -> do
+        w <- chr . fromIntegral <$> VM.unsafeRead mem dp
+        putChar w
+        go (ip+1) dp
+
+      -- mem[dp] = getchar()
+      GetCh -> do
+        w <- fromIntegral . ord <$> getChar
+        VM.unsafeWrite mem dp w
+        go (ip+1) dp
+
+      -- stop
+      Hlt -> pure ()
+
+      -- unreachable if the IR is well-formed
+      instr -> error ("invalid opcode: " ++ show (fst (unpack8 instr)))
 
 -- | JIT compile and execute an LLVM IR program.
 jit :: AST.Module -> IO ()
@@ -293,6 +352,10 @@ runLLVM f ast =
 -- | The name of the brainfuck \"main\" function in the LLVM IR.
 bfmain :: AST.Name
 bfmain = AST.Name (fromString "bfmain")
+
+-- | The size of the heap
+memSize :: Int
+memSize = 30000
 
 -- | Plumbing to call the JIT-compiled code.
 foreign import ccall "dynamic" haskFun :: FunPtr (IO ()) -> IO ()
