@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ViewPatterns #-}
 
@@ -5,9 +6,15 @@
 module Language.Brainfuck where
 
 import           Data.Bits ((.|.), (.&.), unsafeShiftL, unsafeShiftR)
+import           Data.String (fromString)
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Word as W
-import qualified LLVM.AST as LLVM
+import           Foreign.Ptr (FunPtr, castFunPtr)
+import qualified LLVM.AST as AST
+import qualified LLVM.Context as LLVM
+import qualified LLVM.ExecutionEngine as LLVM
+import qualified LLVM.Module as LLVM
+import qualified LLVM.Target as LLVM
 
 -------------------------------------------------------------------------------
 -- * Quickie IR
@@ -106,8 +113,19 @@ interpret :: IR -> IO ()
 interpret = error "interpret: unimplemented"
 
 -- | JIT compile and execute an LLVM IR program.
-jit :: LLVM.Module -> IO ()
-jit = error "jit: unimplemented"
+jit :: AST.Module -> IO ()
+jit =
+    runLLVM $ \_ ctx m ->
+    LLVM.withMCJIT ctx optlevel model ptrelim fastins $ \ee ->
+    LLVM.withModuleInEngine ee m $ \em ->
+    LLVM.getFunction em bfmain >>= \case
+      Just fn -> haskFun (castFunPtr fn :: FunPtr (IO ()))
+      Nothing -> error "cannot find program entry point"
+  where
+    optlevel = Just 3  -- optimization level
+    model    = Nothing -- code model ( Default )
+    ptrelim  = Nothing -- frame pointer elimination
+    fastins  = Nothing -- fast instruction selection
 
 
 -------------------------------------------------------------------------------
@@ -118,15 +136,15 @@ dumpir :: Maybe String -> IR -> IO ()
 dumpir = error "dumpir: unimplemented"
 
 -- | Dump the LLVM IR to stdout or a file.
-dumpllvm :: Maybe String -> LLVM.Module -> IO ()
+dumpllvm :: Maybe String -> AST.Module -> IO ()
 dumpllvm = error "dumpllvm: unimplemented"
 
 -- | Dump the LLVM-compiled assembly to stdout or a file.
-dumpasm :: Maybe String -> LLVM.Module -> IO ()
+dumpasm :: Maybe String -> AST.Module -> IO ()
 dumpasm = error "dumpasm: unimplemented"
 
 -- | Dump the LLVM-compiled object code to a file.
-objcompile :: String -> LLVM.Module -> IO ()
+objcompile :: String -> AST.Module -> IO ()
 objcompile = error "objcompile: unimplemented"
 
 
@@ -139,7 +157,7 @@ compile :: String -> IR
 compile = error "compile: unimplemented"
 
 -- | Compile a Quickie IR program to LLVM IR.
-llcompile :: IR -> LLVM.Module
+llcompile :: IR -> AST.Module
 llcompile = error "llcompile: unimplemented"
 
 
@@ -159,3 +177,18 @@ unpack8 instr = (instr .&. 15, fromIntegral (unsafeShiftR instr 4 .&. 255))
 -- | Unpack an instruction into an opcode and a 16-bit argument.
 unpack16 :: Instruction -> (W.Word32, W.Word16)
 unpack16 instr = (instr .&. 15, fromIntegral (unsafeShiftR instr 4 .&. 65535))
+
+-- | Run an LLVM operation on a module.
+runLLVM :: (LLVM.TargetMachine -> LLVM.Context -> LLVM.Module -> IO ()) -> AST.Module -> IO ()
+runLLVM f ast =
+  LLVM.withHostTargetMachine $ \tgt ->
+  LLVM.withContext $ \ctx ->
+  LLVM.withModuleFromAST ctx ast $
+  f tgt ctx
+
+-- | The name of the brainfuck \"main\" function in the LLVM IR.
+bfmain :: AST.Name
+bfmain = AST.Name (fromString "bfmain")
+
+-- | Plumbing to call the JIT-compiled code.
+foreign import ccall "dynamic" haskFun :: FunPtr (IO ()) -> IO ()
