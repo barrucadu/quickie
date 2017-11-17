@@ -451,112 +451,118 @@ llcompile code = AST.defaultModule
 
           -- as long as the IR is well formed, the final block will
           -- end with a ret and there will be no leftover instructions
-          (_, _, _, bs) = V.ifoldl' gen (AST.mkName "entry", initialise, Clean dp0, []) code
+          (_, _, _, _, bs) = V.ifoldl' gen (AST.mkName "entry", initialise, Clean dp0, Nothing, []) code
       in reverse bs
 
     -- generate code, the arguments are: 'n', the name of the current
     -- basic block; 'ops', the (reverse order) list of instructions in
     -- the current basic block; 'dpT', the name of the immutable
-    -- variable currently holding the data pointer; 'bs', the (reverse
-    -- order) list of previous blocks (with the instructions of each
-    -- in the correct order).
+    -- variable currently holding the data pointer; 'dpV', the name of
+    -- the immutable variable last stored to the memory referenced by
+    -- the data pointer (if known) and the postponed store
+    -- instruction; 'bs', the (reverse order) list of previous blocks
+    -- (with the instructions of each in the correct order).
 
-    -- %dpT' = add %dpT, w
-    gen (n, ops, dpT, bs) ip (GoR w) =
+    -- %dpT' = add %dpT, w          -- also execute a postponed store
+    gen (n, ops, dpT, dpV, bs) ip (GoR w) =
       let final = AST.mkName (show ip ++ ".F")
-          op = final .= add (refm16 (tname dpT)) (cint16 w)
-      in (n, op:ops, Dirty final, bs)
+          ops' = (final .= add (refm16 (tname dpT)) (cint16 w)) : (maybe [] ((:[]).snd) dpV) ++ ops
+      in (n, ops', Dirty final, Nothing, bs)
 
-    -- %dpT' = sub %dpT, w
-    gen (n, ops, dpT, bs) ip (GoL w) =
+    -- %dpT' = sub %dpT, w          -- also execute a postponed store
+    gen (n, ops, dpT, dpV, bs) ip (GoL w) =
       let final = AST.mkName (show ip ++ ".F")
-          op = final .= sub (refm16 (tname dpT)) (cint16 w)
-      in (n, op:ops, Dirty final, bs)
+          ops' = (final .= sub (refm16 (tname dpT)) (cint16 w)) : (maybe [] ((:[]).snd) dpV) ++ ops
+      in (n, ops', Dirty final, Nothing, bs)
 
     -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP
+    -- %tmp1 = load %tmpP           -- or just %dpV, if known
     -- %tmp2 = add %tmp1, w
-    -- store %tmpP, %tmp2
-    gen (n, ops, dpT, bs) ip (Inc w) = incdec n ops dpT bs ip w add
+    -- store %tmpP, %tmp2           -- store is postponed until next GoL, GoR, JZ, or JNZ
+    gen (n, ops, dpT, dpV, bs) ip (Inc w) = incdec n ops dpT dpV bs ip w add
 
     -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP
+    -- %tmp1 = load %tmpP           -- or just %dpV, if known
     -- %tmp2 = sub %tmp1, w
-    -- store %tmpP, %tmp2
-    gen (n, ops, dpT, bs) ip (Dec w) = incdec n ops dpT bs ip w sub
+    -- store %tmpP, %tmp2           -- store is postponed until next GoL, GoR, JZ, or JNZ
+    gen (n, ops, dpT, dpV, bs) ip (Dec w) = incdec n ops dpT dpV bs ip w sub
 
     -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP
+    -- %tmp1 = load %tmpP           -- or just %dpV, if known
     -- %tmp2 = mul %tmp1, w
     -- %tmp3 = add %gpT, a
     -- %tmp4 = gep mem [0, %tmp3]
     -- %tmp5 = load %tmp4
     -- %tmp6 = add %tmp5, %tmp2
     -- store %tmp4, %tmp6
-    gen (n, ops, dpT, bs) ip (CMulR a w) = cmul n ops dpT bs ip a w add
+    gen (n, ops, dpT, dpV, bs) ip (CMulR a w) = cmul n ops dpT dpV bs ip a w add
 
     -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP
+    -- %tmp1 = load %tmpP           -- or just %dpV, if known
     -- %tmp2 = mul %tmp1, w
     -- %tmp3 = add %gpT, a
     -- %tmp4 = gep mem [0, %tmp3]
     -- %tmp5 = load %tmp4
     -- %tmp6 = add %tmp5, %tmp2
     -- store %tmp4, %tmp6
-    gen (n, ops, dpT, bs) ip (CMulL a w) = cmul n ops dpT bs ip a w sub
+    gen (n, ops, dpT, dpV, bs) ip (CMulL a w) = cmul n ops dpT dpV bs ip a w sub
 
     -- %tmpP = gep mem [0, %dpT]
-    -- store %tmpP, w
-    gen (n, ops, dpT, bs) ip (Set w) =
-      let tmpP = AST.mkName (show ip ++ ".P")
-          ops' =
-            [ store (refp tmpP) (cint8 w)
-            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
-            ] ++ ops
-      in (n, ops', dpT, bs)
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP
-    -- %tmp2 = icmp eq 0, %tmp1
-    -- cbr %tmp2, TRUE, FALSE
-    gen (n, ops, dpT, bs) ip (JZ a) = jmp n ops dpT bs ip (show a) (show ip)
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP
-    -- %tmp2 = icmp eq 0, %tmp1
-    -- cbr %tmp2, FALSE, TRUE
-    gen (n, ops, dpT, bs) ip (JNZ a) = jmp n ops dpT bs ip (show ip) (show a)
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP
-    -- call "putchar" %tmp1
-    gen (n, ops, dpT, bs) ip PutCh =
+    -- %tmp1 = w
+    -- store %tmpP, %tmp1           -- store is postponed until next GoL, GoR, JZ, or JNZ
+    gen (n, ops, dpT, _, bs) ip (Set w) =
       let tmpP = AST.mkName (show ip ++ ".P")
           tmp1 = AST.mkName (show ip ++ ".T1")
           ops' =
-            [ AST.Do (call (gname AST.i32 putchar) [refm tmp1])
-            , tmp1 .= load (refp tmpP)
+            [ tmp1 .= add (cint8 0) (cint8 w)
             , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
             ] ++ ops
-      in (n, ops', dpT, bs)
+      in (n, ops', dpT, Just (tmp1, store (refp tmpP) (refm tmp1)), bs)
+
+    -- %tmpP = gep mem [0, %dpT]
+    -- %tmp1 = load %tmpP           -- or just %dpV, if known
+    -- %tmp2 = icmp eq 0, %tmp1
+    -- cbr %tmp2, TRUE, FALSE
+    gen (n, ops, dpT, dpV, bs) ip (JZ a) = jmp n ops dpT dpV bs ip (show a) (show ip)
+
+    -- %tmpP = gep mem [0, %dpT]
+    -- %tmp1 = load %tmpP           -- or just %dpV, if known
+    -- %tmp2 = icmp eq 0, %tmp1
+    -- cbr %tmp2, FALSE, TRUE
+    gen (n, ops, dpT, dpV, bs) ip (JNZ a) = jmp n ops dpT dpV bs ip (show ip) (show a)
+
+    -- %tmpP = gep mem [0, %dpT]
+    -- %tmp1 = load %tmpP           -- or just %dpV, if known
+    -- call "putchar" %tmp1
+    gen (n, ops, dpT, dpV, bs) ip PutCh =
+      let tmpP = AST.mkName (show ip ++ ".P")
+          tmp1 = AST.mkName (show ip ++ ".T1")
+          ops' = case dpV of
+            Just (var, _) ->
+              (AST.Do (call (gname AST.i32 putchar) [refm var])) : ops
+            Nothing ->
+              [ AST.Do (call (gname AST.i32 putchar) [refm tmp1])
+              , tmp1 .= load (refp tmpP)
+              , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
+              ] ++ ops
+      in (n, ops', dpT, dpV, bs)
 
     -- %tmpP = gep mem [0, %dpT]
     -- %tmp1 = call "getchar"
-    -- store %tmpP, %tmp1
-    gen (n, ops, dpT, bs) ip GetCh =
+    -- store %tmpP, %tmp1           -- store is postponed until next GoL, GoR, JZ, or JNZ
+    gen (n, ops, dpT, _, bs) ip GetCh =
       let tmpP = AST.mkName (show ip ++ ".P")
           tmp1 = AST.mkName (show ip ++ ".T1")
           ops' =
-            [ store (refp tmpP) (refm tmp1)
-            , tmp1 .= call (gname AST.i32 getchar) []
+            [ tmp1 .= call (gname AST.i32 getchar) []
             , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
             ] ++ ops
-      in (n, ops', dpT, bs)
+      in (n, ops', dpT, Just (tmp1, store (refp tmpP) (refm tmp1)), bs)
 
     -- ret
-    gen (n, ops, dpT, bs) ip Hlt =
+    gen (n, ops, dpT, _, bs) ip Hlt =
       let b = block n ops (AST.Ret Nothing [])
-      in (AST.mkName (show ip), [], dpT, b : bs)
+      in (AST.mkName (show ip), [], dpT, Nothing, b : bs)
 
     -- unreachable if the IR is well-formed
     gen _ _ instr = error ("invalid opcode: " ++ show (instr .&. 255))
@@ -598,21 +604,22 @@ llcompile code = AST.defaultModule
 
     -- a helper for 'Inc' / 'Dec', as they use the same logic but
     -- differ in the arithmetic instruction used
-    incdec n ops dpT bs ip w llop =
+    incdec n ops dpT dpV bs ip w llop =
       let tmpP = AST.mkName (show ip ++ ".P")
           tmp1 = AST.mkName (show ip ++ ".T1")
           tmp2 = AST.mkName (show ip ++ ".T2")
-          ops' =
-            [ store (refp tmpP) (refm tmp2)
-            , tmp2 .= llop (refm tmp1) (cint8 w)
-            , tmp1 .= load (refp tmpP)
-            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
-            ] ++ ops
-      in (n, ops', dpT, bs)
+          ops' = (case dpV of
+            Just (var, _) ->
+              [ tmp2 .= llop (refm var) (cint8 w) ]
+            Nothing ->
+              [ tmp2 .= llop (refm tmp1) (cint8 w)
+              , tmp1 .= load (refp tmpP)
+              ]) ++ ((tmpP .= gep mem [cint8 0, refm16 (tname dpT)]) : ops)
+      in (n, ops', dpT, Just (tmp2, store (refp tmpP) (refm tmp2)), bs)
 
     -- a helper for 'CMulR' / 'CMulL', as they use the same logic but
     -- differ in the direction of pointer movement
-    cmul n ops dpT bs ip a w llop =
+    cmul n ops dpT dpV bs ip a w llop =
       let tmpP = AST.mkName (show ip ++ ".P")
           tmp1 = AST.mkName (show ip ++ ".T1")
           tmp2 = AST.mkName (show ip ++ ".T2")
@@ -626,15 +633,19 @@ llcompile code = AST.defaultModule
             , tmp5 .= load (refp tmp4)
             , tmp4 .= gep mem [cint8 0, refm16 tmp3]
             , tmp3 .= llop (refm16 (tname dpT)) (cint16 a)
-            , tmp2 .= mul (refm tmp1) (cint8 w)
-            , tmp1 .= load (refp tmpP)
-            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
-            ] ++ ops
-      in (n, ops', dpT, bs)
+            ] ++ (case dpV of
+            Just (var, _) ->
+              [ tmp2 .= mul (refm var) (cint8 w) ]
+            Nothing ->
+              [ tmp2 .= mul (refm tmp1) (cint8 w)
+              , tmp1 .= load (refp tmpP)
+              , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
+              ]) ++ ops
+      in (n, ops', dpT, dpV, bs)
 
     -- a helper for 'JZ' / 'JNZ', as they use the same comparison but
     -- just swap the true and false cases
-    jmp n ops dpT bs ip true false =
+    jmp n ops dpT dpV bs ip true false =
       let tmpP = AST.mkName (show ip ++ ".P")
           tmp1 = AST.mkName (show ip ++ ".T1")
           tmp2 = AST.mkName (show ip ++ ".T2")
@@ -643,13 +654,18 @@ llcompile code = AST.defaultModule
             Clean _ -> []
             Dirty _ -> [store dp (refm16 (tname dpT))]
           term = AST.CondBr (refb tmp2) (AST.mkName true) (AST.mkName false) []
-          ops' =
-            [ tmp2 .= AST.ICmp AST.EQ (cint8 0) (refm tmp1) []
-            , tmp1 .= load (refp tmpP)
-            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
-            ] ++ storedp ++ ops
+          ops' = (case dpV of
+            Just (var, st) ->
+              [ st
+              , tmp2 .= AST.ICmp AST.EQ (cint8 0) (refm var) []
+              ]
+            Nothing ->
+              [ tmp2 .= AST.ICmp AST.EQ (cint8 0) (refm tmp1) []
+              , tmp1 .= load (refp tmpP)
+              , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
+              ]) ++ storedp ++ ops
           b = block n ops' term
-      in (AST.mkName (show ip), [dp0 .= load dp], Clean dp0, b : bs)
+      in (AST.mkName (show ip), [dp0 .= load dp], Clean dp0, Nothing, b : bs)
 
 
 -------------------------------------------------------------------------------
@@ -679,6 +695,7 @@ runLLVM optimise f ast =
         [ LLVM.PromoteMemoryToRegister
         , LLVM.GlobalValueNumbering True
         , LLVM.InstructionCombining
+        , LLVM.DeadStoreElimination
         , LLVM.SimplifyControlFlowGraph
         ]
       }
