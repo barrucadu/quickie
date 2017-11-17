@@ -46,6 +46,11 @@ import           Text.Printf (printf)
 -- * 8 bit operand
 -- * 4 bits unused
 --
+-- OR:
+--
+-- * 4 bit opcode
+-- * 28 bit jump target
+--
 -- Well-formed instructions are those constructed by the pattern
 -- synonyms.  Any other instruction is ill-formed and may lead to a
 -- runtime error.
@@ -108,15 +113,17 @@ pattern CMulL a w <- (unpack -> (11, a, w)) where CMulL a w = pack 11 a w
 
 -- | Jump if the value under the data pointer is zero.
 --
--- The operand is the address to jump to.
-pattern JZ :: W.Word16 -> Instruction
-pattern JZ a <- (unpack -> (5, a, _)) where JZ a = pack 5 a 0
+-- The operand is the address to jump to.  The address should not
+-- exceed @2^28-1@.
+pattern JZ :: W.Word32 -> Instruction
+pattern JZ a <- (unpack28 -> (5, a)) where JZ a = pack28 5 a
 
 -- | Jump if the value under the data pointer is nonzero.
 --
--- The operand is the address to jump to.
-pattern JNZ :: W.Word16 -> Instruction
-pattern JNZ a <- (unpack -> (6, a, _)) where JNZ a = pack 6 a 0
+-- The operand is the address to jump to.  The address should not
+-- exceed @2^28-1@.
+pattern JNZ :: W.Word32 -> Instruction
+pattern JNZ a <- (unpack28 -> (6, a)) where JNZ a = pack28 6 a
 
 -- | Print the value under the data pointer as an ASCII character
 -- code.
@@ -679,9 +686,20 @@ llcompile code = AST.defaultModule
 pack :: W.Word32 -> W.Word16 -> W.Word8 -> Instruction
 pack op arg1 arg2 = op .|. unsafeShiftL (fromIntegral arg1) 4 .|. unsafeShiftL (fromIntegral arg2) 20
 
--- | Unpack an instruction which has two operands.
+-- | Unpack an instruction.
 unpack :: Instruction -> (W.Word32, W.Word16, W.Word8)
 unpack instr = (instr .&. 15, fromIntegral (unsafeShiftR instr 4 .&. 65535), fromIntegral (unsafeShiftR instr 20 .&. 255))
+
+-- | Pack an address instruction from its components.
+--
+-- You should not use this directly.  The address should not exceed
+-- @2^28-1@.
+pack28 :: W.Word32 -> W.Word32 -> Instruction
+pack28 op addr = op .|. unsafeShiftL addr 4
+
+-- | Unpack an address instruction.
+unpack28 :: Instruction -> (W.Word32, W.Word32)
+unpack28 instr = (instr .&. 15, unsafeShiftR instr 4)
 
 -- | Run an LLVM operation on a module.
 runLLVM :: Bool -> (LLVM.TargetMachine -> LLVM.Context -> LLVM.Module -> IO ()) -> AST.Module -> IO ()
