@@ -431,18 +431,20 @@ llcompile code = AST.defaultModule
           -- block is completed
           --
           -- LLVM does mutable state by pointers; local variables are
-          -- immutable.  so we're going to store the data pointer
-          -- behind a pointer (so a value of type **i8) and load/store
-          -- it when necessary; but in the simple case that leads to a
-          -- lot of loads and stores as every instruction uses the
-          -- cell the data pointer points to.  we can reduce these
-          -- loads and stores by keeping around the data pointer in an
-          -- immutable variable, creating a fresh variable every time
-          -- we do a 'GoL' or 'GoR'; then we just load it once at the
-          -- start of a basic block and store it once (if it changed
-          -- at all!) at the end.  this saves about 3000 loads/stores
-          -- in the mandelbrot program, so it's a good optimisation to
-          -- do.
+          -- immutable.  so we're going to store the data pointer (as
+          -- an index into the mem array) behind a pointer (so a value
+          -- of type *i16) and load/store it when necessary; but in
+          -- the simple case that leads to a lot of loads and stores
+          -- as every instruction uses the cell the data pointer
+          -- points to.  we can reduce these loads and stores by
+          -- keeping around the data pointer in an immutable variable,
+          -- creating a fresh variable every time we do a 'GoL' or
+          -- 'GoR'; then we just load it once at the start of a basic
+          -- block and store it once (if it changed at all!) at the
+          -- end.  this saves about 3000 loads/stores in the
+          -- mandelbrot program, and enables llvm's "mem2reg"
+          -- optimisation which pushes the data pointer into a
+          -- register, so it's a good optimisation to do.
           initialise =
             [ store dp (refm16 dp0)
             , AST.mkName "dp0" .= add (cint16 0) (cint16 (fromIntegral initialdp))
@@ -522,13 +524,13 @@ llcompile code = AST.defaultModule
     -- %tmpP = gep mem [0, %dpT]
     -- %tmp1 = load %tmpP           -- or just %dpV, if known
     -- %tmp2 = icmp eq 0, %tmp1
-    -- cbr %tmp2, TRUE, FALSE
+    -- cbr %tmp2, TRUE, FALSE       -- also execute a postponed store
     gen (n, ops, dpT, dpV, bs) ip (JZ a) = jmp n ops dpT dpV bs ip (show a) (show ip)
 
     -- %tmpP = gep mem [0, %dpT]
     -- %tmp1 = load %tmpP           -- or just %dpV, if known
     -- %tmp2 = icmp eq 0, %tmp1
-    -- cbr %tmp2, FALSE, TRUE
+    -- cbr %tmp2, FALSE, TRUE       -- also execute a postponed store
     gen (n, ops, dpT, dpV, bs) ip (JNZ a) = jmp n ops dpT dpV bs ip (show ip) (show a)
 
     -- %tmpP = gep mem [0, %dpT]
