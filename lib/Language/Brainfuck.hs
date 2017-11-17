@@ -141,7 +141,7 @@ pattern Hlt <- 9 where Hlt = 9
 -- This will typically be slower than 'llcompile'ing and 'jit'ing it.
 interpret :: IR -> IO ()
 interpret code = run' =<< VM.replicate memSize 0 where
-  run' mem = go 0 0 where
+  run' mem = go 0 initialdp where
     -- to improve performance we use unsafe vector operations
     -- everywhere, and do bounds checking only where necessary; in
     -- particular, well-formed IR cannot have the ip go out of range,
@@ -445,7 +445,7 @@ llcompile code = AST.defaultModule
           -- do.
           initialise =
             [ store dp (refm16 dp0)
-            , AST.mkName "dp0" .= add (cint16 0) (cint16 0)
+            , AST.mkName "dp0" .= add (cint16 0) (cint16 (fromIntegral initialdp))
             , AST.mkName "dp"  .= AST.Alloca AST.i16 Nothing 0 []
             ]
 
@@ -697,7 +697,11 @@ getchar = AST.mkName "getchar"
 
 -- | The size of the heap
 memSize :: Int
-memSize = 30000
+memSize = 40000
+
+-- | The initial data pointer
+initialdp :: Int
+initialdp = 10000
 
 -- | Keep track of whether a cached memory value is \"clean\"
 -- (unchanged since it was loaded) or \"dirty\" (changed and must be
