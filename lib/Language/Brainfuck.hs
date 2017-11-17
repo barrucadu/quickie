@@ -679,6 +679,7 @@ runLLVM optimise f ast =
         [ LLVM.PromoteMemoryToRegister
         , LLVM.GlobalValueNumbering True
         , LLVM.InstructionCombining
+        , LLVM.SimplifyControlFlowGraph
         ]
       }
 
