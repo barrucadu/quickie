@@ -7,14 +7,14 @@
 module Language.Brainfuck where
 
 import           Control.Arrow (first)
+import           Control.Exception (try)
+import           Control.Monad (void, when)
 import           Data.Bits ((.|.), (.&.), unsafeShiftL, unsafeShiftR)
 import qualified Data.ByteString.Char8 as BS
 import           Data.Char (chr, ord)
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as VM
 import qualified Data.Word as W
-import           Control.Exception (try)
-import           Control.Monad (void, when)
 import           Foreign.Ptr (FunPtr, castFunPtr)
 import qualified LLVM.Analysis as LLVM
 import qualified LLVM.AST as AST hiding (type')
@@ -221,7 +221,7 @@ jit =
     LLVM.withMCJIT ctx optlevel model ptrelim fastins $ \ee ->
     LLVM.withModuleInEngine ee m $ \em ->
     LLVM.getFunction em bfmain >>= \case
-      Just fn -> haskFun (castFunPtr fn :: FunPtr (IO ()))
+      Just fn -> void (haskFun (castFunPtr fn :: FunPtr (IO Int)))
       Nothing -> error "cannot find program entry point"
   where
     optlevel = Just 3  -- optimization level
@@ -400,7 +400,7 @@ llcompile code = AST.defaultModule
         AST.GlobalDefinition AST.functionDefaults
         { AST.name        = bfmain
         , AST.parameters  = ([], False)
-        , AST.returnType  = AST.void
+        , AST.returnType  = AST.i32
         , AST.basicBlocks = blocks
         }
 
@@ -563,7 +563,7 @@ llcompile code = AST.defaultModule
 
     -- ret
     gen (n, ops, dpT, _, bs) ip Hlt =
-      let b = block n ops (AST.Ret Nothing [])
+      let b = block n ops (AST.Ret (Just (AST.ConstantOperand (ASTC.Int 32 0))) [])
       in (AST.mkName (show ip), [], dpT, Nothing, b : bs)
 
     -- unreachable if the IR is well-formed
@@ -765,4 +765,4 @@ call :: AST.Operand -> [AST.Operand] -> AST.Instruction
 call fn args = AST.Call Nothing AST.C [] (Right fn) [(a, []) | a <- args] [] []
 
 -- | Plumbing to call the JIT-compiled code.
-foreign import ccall "dynamic" haskFun :: FunPtr (IO ()) -> IO ()
+foreign import ccall "dynamic" haskFun :: FunPtr (IO Int) -> IO Int
