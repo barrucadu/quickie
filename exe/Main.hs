@@ -42,7 +42,7 @@ printHelp = putStrLn $ unlines
   , "quickie file --verify"
   , "    run the LLVM verifier on the generated LLVM IR"
   , ""
-  , "quickie file --o target"
+  , "quickie file -o target"
   , "    compile the file and save the object file"
   , ""
   , "quickie file --dump-ir [target]"
