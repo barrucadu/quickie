@@ -675,7 +675,10 @@ runLLVM optimise f ast =
       f tgt ctx m
   where
     passes = LLVM.defaultPassSetSpec
-      { LLVM.transforms = [ LLVM.PromoteMemoryToRegister ]
+      { LLVM.transforms =
+        [ LLVM.PromoteMemoryToRegister
+        , LLVM.GlobalValueNumbering True
+        ]
       }
 
 -- | The name of the brainfuck \"main\" function in the LLVM IR.
