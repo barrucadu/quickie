@@ -678,6 +678,7 @@ runLLVM optimise f ast =
       { LLVM.transforms =
         [ LLVM.PromoteMemoryToRegister
         , LLVM.GlobalValueNumbering True
+        , LLVM.InstructionCombining
         ]
       }
 
