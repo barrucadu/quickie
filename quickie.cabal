@@ -12,14 +12,14 @@ cabal-version:       >=1.10
 
 executable quickie
   main-is:             Main.hs
-  build-depends:       base >=4.9 && <4.10, llvm-hs-pure, quickie
+  build-depends:       base >=4.10 && <4.11, llvm-hs-pure, quickie
   hs-source-dirs:      exe
   default-language:    Haskell2010
-  ghc-options:         -O2 -Wall
+  ghc-options:         -O2 -Wall -threaded -rtsopts
 
 library
   exposed-modules:     Language.Brainfuck
-  build-depends:       base >=4.9 && <4.10, bytestring, containers, llvm-hs, llvm-hs-pure, vector
+  build-depends:       base >=4.10 && <4.11, bytestring, containers, llvm-hs, llvm-hs-pure, vector
   hs-source-dirs:      lib
   default-language:    Haskell2010
   ghc-options:         -O2 -Wall

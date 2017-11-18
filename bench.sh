@@ -1,5 +1,8 @@
-#! /usr/bin/env nix-shell
-#! nix-shell -i bash -p haskellPackages.bench
+#! /usr/bin/env bash
+
+export LC_ALL=en_GB.UTF-8
+export LANG=en_GB.UTF-8
+export LC_CTYPE=en_GB.UTF-8
 
 cd examples
 
@@ -23,12 +26,21 @@ done
 echo "Mode: compiled"
 
 d=`mktemp -d`
+cat > "$d/shim.c" <<EOF
+char mem[40000] = {0};
+
+int bfmain(char**, int);
+
+int main(void) {
+  return bfmain((char**)&mem, 10000);
+}
+EOF
 for example in *.b; do
   fname="${example%.*}"
   infile="$fname.in"
 
   quickie $example -o "$d/$example.o"
-  gcc "$d/$example.o" -o "$d/$example"
+  gcc "$d/shim.c" "$d/$example.o" -o "$d/$example"
 
   if [[ -e $infile ]]; then
     bench "$d/$example < $infile"

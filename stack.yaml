@@ -1,4 +1,4 @@
-resolver: lts-9.13
+resolver: nightly-2017-11-18
 
 packages:
 - .
@@ -10,4 +10,4 @@ flags: {}
 extra-package-dbs: []
 
 nix:
-  packages: [llvm]
+  packages: [bash gcc haskellPackages.bench llvm_5]

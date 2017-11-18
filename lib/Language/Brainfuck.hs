@@ -1,24 +1,28 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ViewPatterns #-}
 
 -- | The Quickie Brainfuck parser and compiler.
 module Language.Brainfuck where
 
+import qualified Control.Concurrent as C
 import           Control.Exception (try)
 import           Control.Monad (void, when)
 import           Data.Bits ((.|.), (.&.), unsafeShiftL, unsafeShiftR)
 import qualified Data.ByteString.Char8 as BS
 import           Data.Char (chr, ord)
 import qualified Data.IntMap.Strict as M
+import           Data.Maybe (fromMaybe)
+import           Data.String (IsString(..))
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as VM
+import qualified Data.Vector.Storable.Mutable as VSM
 import qualified Data.Word as W
-import           Foreign.Ptr (FunPtr, castFunPtr)
+import qualified Foreign.Ptr as F
 import qualified LLVM.Analysis as LLVM
 import qualified LLVM.AST as AST hiding (type')
-import qualified LLVM.AST.AddrSpace as AST
 import qualified LLVM.AST.CallingConvention as AST
 import qualified LLVM.AST.Constant as ASTC
 import qualified LLVM.AST.Global as AST
@@ -32,7 +36,7 @@ import qualified LLVM.Module as LLVM
 import qualified LLVM.PassManager as LLVM
 import qualified LLVM.Target as LLVM
 import qualified LLVM.Transforms as LLVM
-import           System.IO (IOMode(..), hPutStrLn, openFile, stdout)
+import           System.IO (BufferMode(..), IOMode(..), hPutStrLn, hSetBuffering, openFile, stdout)
 import           Text.Printf (printf)
 
 -------------------------------------------------------------------------------
@@ -147,7 +151,44 @@ pattern Hlt <- 9 where Hlt = 9
 --
 -- This will typically be slower than 'llcompile'ing and 'jit'ing it.
 interpret :: IR -> IO ()
-interpret code = run' =<< VM.replicate memSize 0 where
+interpret = interpretWithJIT Nothing
+
+-- | JIT compile and execute an LLVM IR program.
+--
+-- This will use 'interpret' initially and compile the program in a
+-- separate thread.  It will switch to the compiled code as it
+-- completes.
+jit :: IR -> IO ()
+jit code = do
+    fnvar   <- C.newEmptyMVar
+    killvar <- C.newEmptyMVar
+    _ <- C.forkIO (jitCompile fnvar killvar)
+    interpretWithJIT (Just fnvar) code
+    C.putMVar killvar ()
+  where
+    jitCompile fnvar killvar = runLLVM True go (llcompileForJIT code) where
+      go _ ctx m =
+        LLVM.withMCJIT ctx (Just 1) Nothing Nothing Nothing $ \ee ->
+        LLVM.withModuleInEngine ee m $ \em ->
+        LLVM.getFunction em bfmain >>= \case
+          Just fn -> do
+            C.putMVar fnvar $ haskFun (F.castFunPtr fn)
+            -- LLVM context is destroyed when the action terminates,
+            -- so keep the thread alive
+            C.takeMVar killvar
+          Nothing ->
+            C.putMVar fnvar $ \_ _ _ -> pure jitNoSuchFunc
+
+-- | Helper for 'interpret' and 'jit': starts interpreting the IR,
+-- periodically checking if the JIT-compiled version is ready.
+--
+-- If an @MVar@ is provided, it will be checked (non-blockingly) at
+-- the end of every loop.  If it contains a function pointer at that
+-- time, then it shall call the function to jump to the compiled code.
+--
+-- You should not call this directly.
+interpretWithJIT :: Maybe (C.MVar (F.Ptr W.Word8 -> W.Word16 -> W.Word32 -> IO Int)) -> IR -> IO ()
+interpretWithJIT fnvar code = hSetBuffering stdout NoBuffering >> (run' =<< VSM.replicate memSize 0) where
   run' mem = go 0 initialdp where
     -- to improve performance we use unsafe vector operations
     -- everywhere, and do bounds checking only where necessary; in
@@ -166,53 +207,55 @@ interpret code = run' =<< VM.replicate memSize 0 where
 
       -- mem[dp] = (mem[dp] + w), wrapping
       Inc w -> do
-        VM.unsafeModify mem (+w) dp
+        VSM.unsafeModify mem (+w) dp
         go (ip+1) dp
 
       -- mem[dp] = (mem[dp] - w), wrapping
       Dec w -> do
-        VM.unsafeModify mem (subtract w) dp
+        VSM.unsafeModify mem (subtract w) dp
         go (ip+1) dp
 
       -- mem[dp] = w
       Set w -> do
-        VM.unsafeWrite mem dp w
+        VSM.unsafeWrite mem dp w
         go (ip+1) dp
 
       -- mem[dp+a] = mem[dp+a] + mem[dp] * i
       CMulR a w -> do
         let dp' = dp + fromIntegral a
-        x <- VM.unsafeRead mem dp
-        VM.unsafeModify mem (\y -> y + x * w) (if dp' >= memSize then memSize-1 else dp')
+        x <- VSM.unsafeRead mem dp
+        VSM.unsafeModify mem (\y -> y + x * w) (if dp' >= memSize then memSize-1 else dp')
         go (ip+1) dp
 
       -- mem[dp-a] = mem[dp-a] + mem[dp] * i
       CMulL a w -> do
         let dp' = dp - fromIntegral a
-        x <- VM.unsafeRead mem dp
-        VM.unsafeModify mem (\y -> y + x * w) (if dp' < 0 then 0 else dp')
+        x <- VSM.unsafeRead mem dp
+        VSM.unsafeModify mem (\y -> y + x * w) (if dp' < 0 then 0 else dp')
         go (ip+1) dp
 
       -- ip = ((mem[dp] == 0 ? a : ip) + 1)
       JZ a -> do
-        w <- VM.unsafeRead mem dp
-        go (if w == 0 then fromIntegral a + 1 else ip + 1) dp
+        w <- VSM.unsafeRead mem dp
+        let tgt = if w == 0 then fromIntegral a else ip
+        tryjit tgt dp
 
       -- ip = ((mem[dp] == 0 ? ip : a) + 1)
       JNZ a -> do
-        w <- VM.unsafeRead mem dp
-        go (if w == 0 then ip + 1 else fromIntegral a + 1) dp
+        w <- VSM.unsafeRead mem dp
+        let tgt = if w == 0 then ip else fromIntegral a
+        tryjit tgt dp
 
       -- putchar(mem[dp])
       PutCh -> do
-        w <- chr . fromIntegral <$> VM.unsafeRead mem dp
+        w <- chr . fromIntegral <$> VSM.unsafeRead mem dp
         putChar w
         go (ip+1) dp
 
       -- mem[dp] = getchar()
       GetCh -> do
         w <- fromIntegral . ord <$> getChar
-        VM.unsafeWrite mem dp w
+        VSM.unsafeWrite mem dp w
         go (ip+1) dp
 
       -- stop
@@ -221,20 +264,17 @@ interpret code = run' =<< VM.replicate memSize 0 where
       -- unreachable if the IR is well-formed
       instr -> error ("invalid opcode: " ++ show (instr .&. 255))
 
--- | JIT compile and execute an LLVM IR program.
-jit :: AST.Module -> IO ()
-jit =
-    runLLVM True $ \_ ctx m ->
-    LLVM.withMCJIT ctx optlevel model ptrelim fastins $ \ee ->
-    LLVM.withModuleInEngine ee m $ \em ->
-    LLVM.getFunction em bfmain >>= \case
-      Just fn -> void (haskFun (castFunPtr fn :: FunPtr (IO Int)))
-      Nothing -> error "cannot find program entry point"
-  where
-    optlevel = Just 3  -- optimization level
-    model    = Nothing -- code model ( Default )
-    ptrelim  = Nothing -- frame pointer elimination
-    fastins  = Nothing -- fast instruction selection
+    -- switch to the JIT if it's ready
+    tryjit tgt dp = case fnvar of
+      Just fnvar' -> C.tryTakeMVar fnvar' >>= \case
+        Just fn -> VSM.unsafeWith mem $ \memptr ->
+          fn memptr (fromIntegral dp) (fromIntegral tgt) >>= \case
+            0 -> pure () -- success
+            r | r == jitNoSuchFunc -> go (tgt + 1) dp -- couldn't find function
+              | r == jitNoSuchCase -> go (tgt + 1) dp -- couldn't jump to case
+              | otherwise          -> error ("failure in JITed code: " ++ show r)
+        Nothing -> go (tgt + 1) dp
+      Nothing -> go (tgt + 1) dp
 
 
 -------------------------------------------------------------------------------
@@ -346,7 +386,7 @@ compile s0 = V.create (compile' (filter isbf s0)) where
       --
       -- - a loop which adds to some other cells and decrements the
       --   current cell by one is a copy/multiply loop
-      loop l0 = lgo (0::Int) (0::Int) M.empty l0 where
+      loop l0 = lgo (0 :: Int) (0 :: Int) (M.empty :: M.IntMap Int) l0 where
         lgo dpoff delta factors ('>':ls) = lgo (dpoff+1) delta factors ls
         lgo dpoff delta factors ('<':ls) = lgo (dpoff-1) delta factors ls
         lgo dpoff delta factors ('-':ls)
@@ -362,9 +402,9 @@ compile s0 = V.create (compile' (filter isbf s0)) where
                                then (\v' -> (v', sz + chunkSize)) <$> VM.unsafeGrow vcode chunkSize
                                else pure (vcode, sz)
               let cmul dpoff factor = if dpoff < 1
-                                      then CMulL (fromIntegral $ abs dpoff) factor
-                                      else CMulR (fromIntegral dpoff) factor
-              let (ip', m) = M.foldrWithKey' (\dpoff factor (ip', m) -> (ip' + 1, m >> VM.unsafeWrite vcode' ip' (cmul dpoff factor))) (ip, pure ()) factors
+                                      then CMulL (fromIntegral $ abs dpoff) (fromIntegral factor)
+                                      else CMulR (fromIntegral dpoff) (fromIntegral factor)
+              let (ip', m) = M.foldrWithKey' (\dpoff factor (ip_, m_) -> (ip_ + 1, m_ >> VM.unsafeWrite vcode' ip_ (cmul dpoff factor))) (ip, pure ()) factors
               m
               VM.unsafeWrite vcode' ip' (Set 0)
               go vcode' (ip'+1) (sz' - M.size factors - 1) stk ls
@@ -401,282 +441,330 @@ compile s0 = V.create (compile' (filter isbf s0)) where
   -- frequent reallocation
   chunkSize = 256
 
--- | Compile a Quickie IR program to LLVM IR.
-llcompile :: IR -> AST.Module
-llcompile code = AST.defaultModule
+-- | Compile a Quickie IR program to LLVM IR, as a standalone program.
+--
+-- This produces a function callable from C with the type @bfmain ::
+-- (uint8_t**, uint32_t) -> uint32_t@.  The first parameter is the
+-- memory array, the second is the starting data pointer address.  The
+-- return value will be 0 on success.
+--
+-- With a memory array of 40,000 cells and an initial data pointer of
+-- 10,000 (to make it a bit less likely for programs to run out of
+-- bounds and crash), the following C shim can be used to produce an
+-- executable program:
+--
+-- @
+--    char mem[40000] = {0};
+--
+--    int bfmain(char**, int);
+--
+--    int main(void) {
+--      return bfmain((char**)&mem, 10000);
+--    }
+-- @
+--
+-- Build with @quickie foo.b -o foo.o; gcc main.c foo.o -o foo@.
+llcompileForStandalone :: IR -> AST.Module
+llcompileForStandalone code = AST.defaultModule
     { AST.moduleDefinitions =
-      [ -- the main function (name must match what the JIT calls)
-        AST.GlobalDefinition AST.functionDefaults
-        { AST.name        = bfmain
-        , AST.parameters  = ([], False)
+      [ AST.GlobalDefinition AST.functionDefaults
+        { AST.name        = AST.mkName bfmain
+        , AST.parameters  = ([AST.Parameter ty n [] | (ty, n) <- [(AST.ptr $ AST.ArrayType (fromIntegral memSize) AST.i8, mem), (AST.i16, di)]], False)
         , AST.returnType  = AST.i32
-        , AST.basicBlocks = blocks
+        , AST.basicBlocks = llcompileMainBBs mem di Nothing code
         }
-
-        -- the memory array, zero initialised
-      , AST.GlobalDefinition AST.globalVariableDefaults
-        { AST.name        = AST.mkName "mem"
-        , AST.linkage     = AST.Internal
-        , AST.isConstant  = False
-        , AST.initializer = Just (ASTC.Array AST.i8 (replicate memSize (ASTC.Int 8 0)))
-        , AST.type'       = AST.ArrayType (fromIntegral memSize) AST.i8
-        }
-
-        -- library functions
       , extern getchar []        AST.i32
       , extern putchar [AST.i32] AST.i32
       ]
     }
   where
-    -- an LLVM function consists of a sequence of "basic blocks",
-    -- where a basic block is a sequence of instructions followed by a
-    -- single terminator.  jumping to or from the middle of a basic
-    -- block is not possible.
-    blocks =
-      let dp0 = AST.mkName "dp0"
-          -- we're going to construct the sequence of instructions of
-          -- a basic block in reverse, as prepending to a list is
-          -- efficient; but then the list must be reversed when a
-          -- block is completed
-          --
-          -- LLVM does mutable state by pointers; local variables are
-          -- immutable.  so we're going to store the data pointer (as
-          -- an index into the mem array) behind a pointer (so a value
-          -- of type *i16) and load/store it when necessary; but in
-          -- the simple case that leads to a lot of loads and stores
-          -- as every instruction uses the cell the data pointer
-          -- points to.  we can reduce these loads and stores by
-          -- keeping around the data pointer in an immutable variable,
-          -- creating a fresh variable every time we do a 'GoL' or
-          -- 'GoR'; then we just load it once at the start of a basic
-          -- block and store it once (if it changed at all!) at the
-          -- end.  this saves about 3000 loads/stores in the
-          -- mandelbrot program, and enables llvm's "mem2reg"
-          -- optimisation which pushes the data pointer into a
-          -- register, so it's a good optimisation to do.
-          initialise =
-            [ store dp (refm16 dp0)
-            , AST.mkName "dp0" .= add (cint16 0) (cint16 (fromIntegral initialdp))
-            , AST.mkName "dp"  .= AST.Alloca AST.i16 Nothing 0 []
+    mem = AST.mkName "mem"
+    di  = AST.mkName "di"
+
+-- | Compile a Quickie IR program to LLVM IR, to be invoked from the
+-- JIT interpreter.
+--
+-- You should not call this directly.
+llcompileForJIT :: IR -> AST.Module
+llcompileForJIT code = AST.defaultModule
+    { AST.moduleDefinitions =
+      [ AST.GlobalDefinition AST.functionDefaults
+        { AST.name        = AST.mkName bfmain
+        , AST.parameters  = ([AST.Parameter ty n [] | (ty, n) <- [(AST.ptr $ AST.ArrayType (fromIntegral memSize) AST.i8, mem), (AST.i16, di), (AST.i32, tgt)]], False)
+        , AST.returnType  = AST.i32
+        , AST.basicBlocks = llcompileMainBBs mem di (Just (AST.Switch (AST.LocalReference AST.i32 tgt) exit dests [])) code
+        }
+      , extern getchar []        AST.i32
+      , extern putchar [AST.i32] AST.i32
+      ]
+    }
+  where
+    mem  = AST.mkName "mem"
+    di   = AST.mkName "di"
+    tgt  = AST.mkName "tgt"
+    exit = AST.mkName "exit"
+    dests = V.foldr' jmpAddrs [] code
+
+    jmpAddrs (JZ  a) ds = (ASTC.Int 32 $ fromIntegral a, AST.mkName (show a)):ds
+    jmpAddrs (JNZ a) ds = (ASTC.Int 32 $ fromIntegral a, AST.mkName (show a)):ds
+    jmpAddrs _ ds = ds
+
+-- | Helper for 'llcompileForStandalone' and 'llcompileForJIT'.
+--
+-- You should not call this directly.
+llcompileMainBBs :: AST.Name -> AST.Name -> Maybe AST.Terminator -> IR -> [AST.BasicBlock]
+llcompileMainBBs memname diname eterm code = reverse (exit:blocks) where
+  -- an LLVM function consists of a sequence of "basic blocks", where
+  -- a basic block is a sequence of instructions followed by a single
+  -- terminator.  jumping to or from the middle of a basic block is
+  -- not possible.
+  --
+  -- we're going to construct the sequence of instructions of a basic
+  -- block in reverse, as prepending to a list is efficient; but then
+  -- the list must be reversed when a block is completed
+  --
+  -- LLVM does mutable state by pointers; local variables are
+  -- immutable.  so we're going to store the data pointer (as an index
+  -- into the mem array) behind a pointer (so a value of type *i16)
+  -- and load/store it when necessary; but in the simple case that
+  -- leads to a lot of loads and stores as every instruction uses the
+  -- cell the data pointer points to.  we can reduce these loads and
+  -- stores by keeping around the data pointer in an immutable
+  -- variable, creating a fresh variable every time we do a 'GoL' or
+  -- 'GoR'; then we just load it once at the start of a basic block
+  -- and store it once (if it changed at all!) at the end.  this saves
+  -- about 3000 loads/stores in the mandelbrot program, and enables
+  -- llvm's "mem2reg" optimisation which pushes the data pointer into
+  -- a register, so it's a good optimisation to do.
+  entry = block (AST.mkName "entry")
+    [ store dp (refm16 (AST.mkName "dp0"))
+    , AST.mkName "dp0" .= add (cint16 0) (refm16 diname)
+    , AST.mkName "dp"  .= AST.Alloca AST.i16 Nothing 0 []
+    ]
+    (fromMaybe (AST.Br (AST.mkName "bf") []) eterm)
+
+  -- used to signal unsuccessful termination, nothing in the generated
+  -- code here refers to it; but the provided terminator may.
+  exit = block (AST.mkName "exit") [] (AST.Ret (Just (AST.ConstantOperand (ASTC.Int 32 (fromIntegral jitNoSuchCase)))) [])
+
+  -- as long as the IR is well formed, the final block will end
+  -- with a ret and there will be no leftover instructions
+  (_, _, _, _, blocks) = V.ifoldl' gen (AST.mkName "bf", [], Clean (AST.mkName "dp0"), Nothing, [entry]) code
+
+  -- generate code, the arguments are: 'n', the name of the current
+  -- basic block; 'ops', the (reverse order) list of instructions in
+  -- the current basic block; 'dpT', the name of the immutable
+  -- variable currently holding the data pointer; 'dpV', the name of
+  -- the immutable variable last stored to the memory referenced by
+  -- the data pointer (if known) and the postponed store instruction;
+  -- 'bs', the (reverse order) list of previous blocks (with the
+  -- instructions of each in the correct order).
+
+  -- %dpT' = add %dpT, w          -- also execute a postponed store
+  gen (n, ops, dpT, dpV, bs) ip (GoR w) =
+    let final = AST.mkName (show ip ++ ".F")
+        ops' =
+          [ final .= add (refm16 (tname dpT)) (cint16 w)
+          ] ++ maybe [] ((:[]) . snd) dpV ++ ops
+    in (n, ops', Dirty final, Nothing, bs)
+
+  -- %dpT' = sub %dpT, w          -- also execute a postponed store
+  gen (n, ops, dpT, dpV, bs) ip (GoL w) =
+    let final = AST.mkName (show ip ++ ".F")
+        ops' =
+          [ final .= sub (refm16 (tname dpT)) (cint16 w)
+          ] ++ maybe [] ((:[]) . snd) dpV ++ ops
+    in (n, ops', Dirty final, Nothing, bs)
+
+  -- %tmpP = gep mem [0, %dpT]
+  -- %tmp1 = load %tmpP           -- or just %dpV, if known
+  -- %tmp2 = add %tmp1, w
+  -- store %tmpP, %tmp2           -- store is postponed until next GoL, GoR, JZ, or JNZ
+  gen (n, ops, dpT, dpV, bs) ip (Inc w) = incdec n ops dpT dpV bs ip w add
+
+  -- %tmpP = gep mem [0, %dpT]
+  -- %tmp1 = load %tmpP           -- or just %dpV, if known
+  -- %tmp2 = sub %tmp1, w
+  -- store %tmpP, %tmp2           -- store is postponed until next GoL, GoR, JZ, or JNZ
+  gen (n, ops, dpT, dpV, bs) ip (Dec w) = incdec n ops dpT dpV bs ip w sub
+
+  -- %tmpP = gep mem [0, %dpT]
+  -- %tmp1 = load %tmpP           -- or just %dpV, if known
+  -- %tmp2 = mul %tmp1, w
+  -- %tmp3 = add %gpT, a
+  -- %tmp4 = gep mem [0, %tmp3]
+  -- %tmp5 = load %tmp4
+  -- %tmp6 = add %tmp5, %tmp2
+  -- store %tmp4, %tmp6
+  gen (n, ops, dpT, dpV, bs) ip (CMulR a w) = cmul n ops dpT dpV bs ip a w add
+
+  -- %tmpP = gep mem [0, %dpT]
+  -- %tmp1 = load %tmpP           -- or just %dpV, if known
+  -- %tmp2 = mul %tmp1, w
+  -- %tmp3 = add %gpT, a
+  -- %tmp4 = gep mem [0, %tmp3]
+  -- %tmp5 = load %tmp4
+  -- %tmp6 = add %tmp5, %tmp2
+  -- store %tmp4, %tmp6
+  gen (n, ops, dpT, dpV, bs) ip (CMulL a w) = cmul n ops dpT dpV bs ip a w sub
+
+  -- %tmpP = gep mem [0, %dpT]
+  -- %tmp1 = w
+  -- store %tmpP, %tmp1           -- store is postponed until next GoL, GoR, JZ, or JNZ
+  gen (n, ops, dpT, _, bs) ip (Set w) =
+    let tmpP = AST.mkName (show ip ++ ".P")
+        tmp1 = AST.mkName (show ip ++ ".T1")
+        ops' =
+          [ tmp1 .= add (cint8 0) (cint8 w)
+          , tmpP .= gepmem (tname dpT)
+          ] ++ ops
+    in (n, ops', dpT, Just (tmp1, store (refp tmpP) (refm tmp1)), bs)
+
+  -- %tmpP = gep mem [0, %dpT]
+  -- %tmp1 = load %tmpP           -- or just %dpV, if known
+  -- %tmp2 = icmp eq 0, %tmp1
+  -- cbr %tmp2, TRUE, FALSE       -- also execute a postponed store
+  gen (n, ops, dpT, dpV, bs) ip (JZ a) = jmp n ops dpT dpV bs ip (show a) (show ip)
+
+  -- %tmpP = gep mem [0, %dpT]
+  -- %tmp1 = load %tmpP           -- or just %dpV, if known
+  -- %tmp2 = icmp eq 0, %tmp1
+  -- cbr %tmp2, FALSE, TRUE       -- also execute a postponed store
+  gen (n, ops, dpT, dpV, bs) ip (JNZ a) = jmp n ops dpT dpV bs ip (show ip) (show a)
+
+  -- %tmpP = gep mem [0, %dpT]
+  -- %tmp1 = load %tmpP           -- or just %dpV, if known
+  -- %tmp2 = zext %tmp1
+  -- call "putchar" %tmp2
+  gen (n, ops, dpT, dpV, bs) ip PutCh =
+    let tmpP = AST.mkName (show ip ++ ".P")
+        tmp1 = AST.mkName (show ip ++ ".T1")
+        tmp2 = AST.mkName (show ip ++ ".T2")
+        ops' = AST.Do (call (gname (funty [AST.i32] AST.i32) putchar) [refm32 tmp2]) : (case dpV of
+          Just (var, _) ->
+             [ tmp2 .= zext (refm var) AST.i32 ]
+          Nothing ->
+            [ tmp2 .= zext (refm tmp1) AST.i32
+            , tmp1 .= load (refp tmpP)
+            , tmpP .= gepmem (tname dpT)
+            ]) ++ ops
+    in (n, ops', dpT, dpV, bs)
+
+  -- %tmpP = gep mem [0, %dpT]
+  -- %tmp1 = call "getchar"
+  -- %tmp2 = trunc %tmp1
+  -- store %tmpP, %tmp2           -- store is postponed until next GoL, GoR, JZ, or JNZ
+  gen (n, ops, dpT, _, bs) ip GetCh =
+    let tmpP = AST.mkName (show ip ++ ".P")
+        tmp1 = AST.mkName (show ip ++ ".T1")
+        tmp2 = AST.mkName (show ip ++ ".T2")
+        ops' =
+          [ tmp2 .= trunc (refm32 tmp1) AST.i8
+          , tmp1 .= call (gname (funty [] AST.i32) getchar) []
+          , tmpP .= gepmem (tname dpT)
+          ] ++ ops
+    in (n, ops', dpT, Just (tmp2, store (refp tmpP) (refm tmp2)), bs)
+
+  -- ret
+  gen (n, ops, dpT, _, bs) ip Hlt =
+    let b = block n ops (AST.Ret (Just (AST.ConstantOperand (ASTC.Int 32 0))) [])
+    in (AST.mkName (show ip), [], dpT, Nothing, b : bs)
+
+  -- unreachable if the IR is well-formed
+  gen _ _ instr = error ("invalid opcode: " ++ show (instr .&. 255))
+
+  -- reference to an external name
+  gname ty = AST.ConstantOperand . ASTC.GlobalReference ty
+
+  refm = AST.LocalReference AST.i8
+
+  -- reference to an i16
+  refm16 = AST.LocalReference AST.i16
+
+  -- reference to an i32
+  refm32 = AST.LocalReference AST.i32
+
+  -- reference to a *i8
+  refp = AST.LocalReference (AST.ptr AST.i8)
+
+  -- reference to a bool
+  refb = AST.LocalReference AST.i1
+
+  (.=) = (AST.:=)
+
+  -- the data pointer
+  dp = AST.LocalReference (AST.ptr AST.i16) (AST.mkName "dp")
+
+  -- the global memory
+  mem = AST.LocalReference (AST.ArrayType (fromIntegral memSize) AST.i8) memname
+
+  -- index into the global memory
+  gepmem idx = gep mem [cint8 0, refm16 idx]
+
+  -- a helper for 'Inc' / 'Dec', as they use the same logic but differ
+  -- in the arithmetic instruction used
+  incdec n ops dpT dpV bs ip w llop =
+    let tmpP = AST.mkName (show ip ++ ".P")
+        tmp1 = AST.mkName (show ip ++ ".T1")
+        tmp2 = AST.mkName (show ip ++ ".T2")
+        ops' = (case dpV of
+          Just (var, _) ->
+            [ tmp2 .= llop (refm var) (cint8 w) ]
+          Nothing ->
+            [ tmp2 .= llop (refm tmp1) (cint8 w)
+            , tmp1 .= load (refp tmpP)
+            ]) ++ ((tmpP .= gepmem (tname dpT)) : ops)
+    in (n, ops', dpT, Just (tmp2, store (refp tmpP) (refm tmp2)), bs)
+
+  -- a helper for 'CMulR' / 'CMulL', as they use the same logic but
+  -- differ in the direction of pointer movement
+  cmul n ops dpT dpV bs ip a w llop =
+    let tmpP = AST.mkName (show ip ++ ".P")
+        tmp1 = AST.mkName (show ip ++ ".T1")
+        tmp2 = AST.mkName (show ip ++ ".T2")
+        tmp3 = AST.mkName (show ip ++ ".T3")
+        tmp4 = AST.mkName (show ip ++ ".T4")
+        tmp5 = AST.mkName (show ip ++ ".T5")
+        tmp6 = AST.mkName (show ip ++ ".T6")
+        ops' =
+          [ store (refp tmp4) (refm tmp6)
+          , tmp6 .= add (refm tmp5) (refm tmp2)
+          , tmp5 .= load (refp tmp4)
+          , tmp4 .= gepmem tmp3
+          , tmp3 .= llop (refm16 (tname dpT)) (cint16 a)
+          ] ++ (case dpV of
+          Just (var, _) ->
+            [ tmp2 .= mul (refm var) (cint8 w) ]
+          Nothing ->
+            [ tmp2 .= mul (refm tmp1) (cint8 w)
+            , tmp1 .= load (refp tmpP)
+            , tmpP .= gepmem (tname dpT)
+            ]) ++ ops
+    in (n, ops', dpT, dpV, bs)
+
+  -- a helper for 'JZ' / 'JNZ', as they use the same comparison but
+  -- just swap the true and false cases
+  jmp n ops dpT dpV bs ip true false =
+    let tmpP = AST.mkName (show ip ++ ".P")
+        tmp1 = AST.mkName (show ip ++ ".T1")
+        tmp2 = AST.mkName (show ip ++ ".T2")
+        dp0  = AST.mkName ("dp" ++ show ip)
+        storedp = case dpT of
+          Clean _ -> []
+          Dirty _ -> [ store dp (refm16 (tname dpT)) ]
+        term = AST.CondBr (refb tmp2) (AST.mkName true) (AST.mkName false) []
+        ops' = (case dpV of
+          Just (var, st) ->
+            [ st
+            , tmp2 .= AST.ICmp AST.EQ (cint8 0) (refm var) []
             ]
-
-          -- as long as the IR is well formed, the final block will
-          -- end with a ret and there will be no leftover instructions
-          (_, _, _, _, bs) = V.ifoldl' gen (AST.mkName "entry", initialise, Clean dp0, Nothing, []) code
-      in reverse bs
-
-    -- generate code, the arguments are: 'n', the name of the current
-    -- basic block; 'ops', the (reverse order) list of instructions in
-    -- the current basic block; 'dpT', the name of the immutable
-    -- variable currently holding the data pointer; 'dpV', the name of
-    -- the immutable variable last stored to the memory referenced by
-    -- the data pointer (if known) and the postponed store
-    -- instruction; 'bs', the (reverse order) list of previous blocks
-    -- (with the instructions of each in the correct order).
-
-    -- %dpT' = add %dpT, w          -- also execute a postponed store
-    gen (n, ops, dpT, dpV, bs) ip (GoR w) =
-      let final = AST.mkName (show ip ++ ".F")
-          ops' = (final .= add (refm16 (tname dpT)) (cint16 w)) : (maybe [] ((:[]).snd) dpV) ++ ops
-      in (n, ops', Dirty final, Nothing, bs)
-
-    -- %dpT' = sub %dpT, w          -- also execute a postponed store
-    gen (n, ops, dpT, dpV, bs) ip (GoL w) =
-      let final = AST.mkName (show ip ++ ".F")
-          ops' = (final .= sub (refm16 (tname dpT)) (cint16 w)) : (maybe [] ((:[]).snd) dpV) ++ ops
-      in (n, ops', Dirty final, Nothing, bs)
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP           -- or just %dpV, if known
-    -- %tmp2 = add %tmp1, w
-    -- store %tmpP, %tmp2           -- store is postponed until next GoL, GoR, JZ, or JNZ
-    gen (n, ops, dpT, dpV, bs) ip (Inc w) = incdec n ops dpT dpV bs ip w add
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP           -- or just %dpV, if known
-    -- %tmp2 = sub %tmp1, w
-    -- store %tmpP, %tmp2           -- store is postponed until next GoL, GoR, JZ, or JNZ
-    gen (n, ops, dpT, dpV, bs) ip (Dec w) = incdec n ops dpT dpV bs ip w sub
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP           -- or just %dpV, if known
-    -- %tmp2 = mul %tmp1, w
-    -- %tmp3 = add %gpT, a
-    -- %tmp4 = gep mem [0, %tmp3]
-    -- %tmp5 = load %tmp4
-    -- %tmp6 = add %tmp5, %tmp2
-    -- store %tmp4, %tmp6
-    gen (n, ops, dpT, dpV, bs) ip (CMulR a w) = cmul n ops dpT dpV bs ip a w add
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP           -- or just %dpV, if known
-    -- %tmp2 = mul %tmp1, w
-    -- %tmp3 = add %gpT, a
-    -- %tmp4 = gep mem [0, %tmp3]
-    -- %tmp5 = load %tmp4
-    -- %tmp6 = add %tmp5, %tmp2
-    -- store %tmp4, %tmp6
-    gen (n, ops, dpT, dpV, bs) ip (CMulL a w) = cmul n ops dpT dpV bs ip a w sub
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = w
-    -- store %tmpP, %tmp1           -- store is postponed until next GoL, GoR, JZ, or JNZ
-    gen (n, ops, dpT, _, bs) ip (Set w) =
-      let tmpP = AST.mkName (show ip ++ ".P")
-          tmp1 = AST.mkName (show ip ++ ".T1")
-          ops' =
-            [ tmp1 .= add (cint8 0) (cint8 w)
-            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
-            ] ++ ops
-      in (n, ops', dpT, Just (tmp1, store (refp tmpP) (refm tmp1)), bs)
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP           -- or just %dpV, if known
-    -- %tmp2 = icmp eq 0, %tmp1
-    -- cbr %tmp2, TRUE, FALSE       -- also execute a postponed store
-    gen (n, ops, dpT, dpV, bs) ip (JZ a) = jmp n ops dpT dpV bs ip (show a) (show ip)
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP           -- or just %dpV, if known
-    -- %tmp2 = icmp eq 0, %tmp1
-    -- cbr %tmp2, FALSE, TRUE       -- also execute a postponed store
-    gen (n, ops, dpT, dpV, bs) ip (JNZ a) = jmp n ops dpT dpV bs ip (show ip) (show a)
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = load %tmpP           -- or just %dpV, if known
-    -- call "putchar" %tmp1
-    gen (n, ops, dpT, dpV, bs) ip PutCh =
-      let tmpP = AST.mkName (show ip ++ ".P")
-          tmp1 = AST.mkName (show ip ++ ".T1")
-          ops' = case dpV of
-            Just (var, _) ->
-              (AST.Do (call (gname AST.i32 putchar) [refm var])) : ops
-            Nothing ->
-              [ AST.Do (call (gname AST.i32 putchar) [refm tmp1])
-              , tmp1 .= load (refp tmpP)
-              , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
-              ] ++ ops
-      in (n, ops', dpT, dpV, bs)
-
-    -- %tmpP = gep mem [0, %dpT]
-    -- %tmp1 = call "getchar"
-    -- store %tmpP, %tmp1           -- store is postponed until next GoL, GoR, JZ, or JNZ
-    gen (n, ops, dpT, _, bs) ip GetCh =
-      let tmpP = AST.mkName (show ip ++ ".P")
-          tmp1 = AST.mkName (show ip ++ ".T1")
-          ops' =
-            [ tmp1 .= call (gname AST.i32 getchar) []
-            , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
-            ] ++ ops
-      in (n, ops', dpT, Just (tmp1, store (refp tmpP) (refm tmp1)), bs)
-
-    -- ret
-    gen (n, ops, dpT, _, bs) ip Hlt =
-      let b = block n ops (AST.Ret (Just (AST.ConstantOperand (ASTC.Int 32 0))) [])
-      in (AST.mkName (show ip), [], dpT, Nothing, b : bs)
-
-    -- unreachable if the IR is well-formed
-    gen _ _ instr = error ("invalid opcode: " ++ show (instr .&. 255))
-
-    -- reference to an external name
-    gname ty = AST.ConstantOperand . ASTC.GlobalReference ty
-
-    -- reference to an i8
-    refm = AST.LocalReference AST.i8
-
-    -- reference to an i16
-    refm16 = AST.LocalReference AST.i16
-
-    -- reference to a *i8
-    refp = AST.LocalReference (ptr AST.i8)
-
-    -- reference to a bool
-    refb = AST.LocalReference AST.i1
-
-    -- pointer type
-    ptr ty = AST.PointerType ty (AST.AddrSpace 0)
-
-    -- end a block
-    block n ops = AST.BasicBlock n (reverse ops) . AST.Do
-
-    -- store the result of an instruction
-    (.=) = (AST.:=)
-
-    -- constant ints
-    cint8  = AST.ConstantOperand . ASTC.Int 8  . (fromIntegral :: W.Word8  -> Integer)
-    cint16 = AST.ConstantOperand . ASTC.Int 16 . (fromIntegral :: W.Word16 -> Integer)
-
-    -- the data pointer
-    dp = AST.LocalReference (ptr AST.i16) (AST.mkName "dp")
-
-    -- the global memory
-    mem = AST.ConstantOperand $
-      ASTC.GlobalReference (AST.ArrayType (fromIntegral memSize) AST.i8) (AST.mkName "mem")
-
-    -- a helper for 'Inc' / 'Dec', as they use the same logic but
-    -- differ in the arithmetic instruction used
-    incdec n ops dpT dpV bs ip w llop =
-      let tmpP = AST.mkName (show ip ++ ".P")
-          tmp1 = AST.mkName (show ip ++ ".T1")
-          tmp2 = AST.mkName (show ip ++ ".T2")
-          ops' = (case dpV of
-            Just (var, _) ->
-              [ tmp2 .= llop (refm var) (cint8 w) ]
-            Nothing ->
-              [ tmp2 .= llop (refm tmp1) (cint8 w)
-              , tmp1 .= load (refp tmpP)
-              ]) ++ ((tmpP .= gep mem [cint8 0, refm16 (tname dpT)]) : ops)
-      in (n, ops', dpT, Just (tmp2, store (refp tmpP) (refm tmp2)), bs)
-
-    -- a helper for 'CMulR' / 'CMulL', as they use the same logic but
-    -- differ in the direction of pointer movement
-    cmul n ops dpT dpV bs ip a w llop =
-      let tmpP = AST.mkName (show ip ++ ".P")
-          tmp1 = AST.mkName (show ip ++ ".T1")
-          tmp2 = AST.mkName (show ip ++ ".T2")
-          tmp3 = AST.mkName (show ip ++ ".T3")
-          tmp4 = AST.mkName (show ip ++ ".T4")
-          tmp5 = AST.mkName (show ip ++ ".T5")
-          tmp6 = AST.mkName (show ip ++ ".T6")
-          ops' =
-            [ store (refp tmp4) (refm tmp6)
-            , tmp6 .= add (refm tmp5) (refm tmp2)
-            , tmp5 .= load (refp tmp4)
-            , tmp4 .= gep mem [cint8 0, refm16 tmp3]
-            , tmp3 .= llop (refm16 (tname dpT)) (cint16 a)
-            ] ++ (case dpV of
-            Just (var, _) ->
-              [ tmp2 .= mul (refm var) (cint8 w) ]
-            Nothing ->
-              [ tmp2 .= mul (refm tmp1) (cint8 w)
-              , tmp1 .= load (refp tmpP)
-              , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
-              ]) ++ ops
-      in (n, ops', dpT, dpV, bs)
-
-    -- a helper for 'JZ' / 'JNZ', as they use the same comparison but
-    -- just swap the true and false cases
-    jmp n ops dpT dpV bs ip true false =
-      let tmpP = AST.mkName (show ip ++ ".P")
-          tmp1 = AST.mkName (show ip ++ ".T1")
-          tmp2 = AST.mkName (show ip ++ ".T2")
-          dp0  = AST.mkName ("dp" ++ show ip)
-          storedp = case dpT of
-            Clean _ -> []
-            Dirty _ -> [store dp (refm16 (tname dpT))]
-          term = AST.CondBr (refb tmp2) (AST.mkName true) (AST.mkName false) []
-          ops' = (case dpV of
-            Just (var, st) ->
-              [ st
-              , tmp2 .= AST.ICmp AST.EQ (cint8 0) (refm var) []
-              ]
-            Nothing ->
-              [ tmp2 .= AST.ICmp AST.EQ (cint8 0) (refm tmp1) []
-              , tmp1 .= load (refp tmpP)
-              , tmpP .= gep mem [cint8 0, refm16 (tname dpT)]
-              ]) ++ storedp ++ ops
-          b = block n ops' term
-      in (AST.mkName (show ip), [dp0 .= load dp], Clean dp0, Nothing, b : bs)
+          Nothing ->
+            [ tmp2 .= AST.ICmp AST.EQ (cint8 0) (refm tmp1) []
+            , tmp1 .= load (refp tmpP)
+            , tmpP .= gepmem (tname dpT)
+            ]) ++ storedp ++ ops
+        b = block n ops' term
+    in (AST.mkName (show ip), [dp0 .= load dp], Clean dp0, Nothing, b : bs)
 
 
 -------------------------------------------------------------------------------
@@ -723,8 +811,8 @@ runLLVM optimise f ast =
       }
 
 -- | The name of the brainfuck \"main\" function in the LLVM IR.
-bfmain :: AST.Name
-bfmain = AST.mkName "main"
+bfmain :: IsString s => s
+bfmain = fromString "bfmain"
 
 -- | The C putchar stdlib function.
 putchar :: AST.Name
@@ -762,11 +850,11 @@ gep tgt idxs = AST.GetElementPtr True tgt idxs []
 
 -- | Load a value from an address.
 load :: AST.Operand -> AST.Instruction
-load ptr = AST.Load False ptr Nothing 0 []
+load p = AST.Load False p Nothing 0 []
 
 -- | Store a value to an address.
 store :: AST.Operand -> AST.Operand -> AST.Named AST.Instruction
-store ptr val = AST.Do $ AST.Store False ptr val Nothing 0 []
+store p val = AST.Do $ AST.Store False p val Nothing 0 []
 
 -- | Integer addition.
 add :: AST.Operand -> AST.Operand -> AST.Instruction
@@ -784,5 +872,43 @@ mul op1 op2 = AST.Mul False False op1 op2 []
 call :: AST.Operand -> [AST.Operand] -> AST.Instruction
 call fn args = AST.Call Nothing AST.C [] (Right fn) [(a, []) | a <- args] [] []
 
+-- | Truncate a larger type to a smaller one.
+trunc :: AST.Operand -> AST.Type -> AST.Instruction
+trunc op ty = AST.Trunc op ty []
+
+-- | Zero-extend a smaller type to a larger one.
+zext :: AST.Operand -> AST.Type -> AST.Instruction
+zext op ty = AST.ZExt op ty []
+
+-- | Function type
+funty :: [AST.Type] -> AST.Type -> AST.Type
+funty args ret = AST.ptr $ AST.FunctionType ret args False
+
+-- | Constant unsigned 8-bit int.
+cint8 :: W.Word8 -> AST.Operand
+cint8 = AST.ConstantOperand . ASTC.Int 8 . fromIntegral
+
+-- | Constant unsigned 16-bit int.
+cint16 :: W.Word16 -> AST.Operand
+cint16 = AST.ConstantOperand . ASTC.Int 16 . fromIntegral
+
+-- | End a basic block (instructions are assumed to be in reverse)
+block :: AST.Name -> [AST.Named AST.Instruction] -> AST.Terminator -> AST.BasicBlock
+block n ops = AST.BasicBlock n (reverse ops) . AST.Do
+
+-- | Error code for the JIT failing to find the main function.
+jitNoSuchFunc :: Int
+jitNoSuchFunc = 90
+
+-- | Error code for the JIT failing to find the case to jump to.
+jitNoSuchCase :: Int
+jitNoSuchCase = 91
+
 -- | Plumbing to call the JIT-compiled code.
-foreign import ccall "dynamic" haskFun :: FunPtr (IO Int) -> IO Int
+foreign import ccall "dynamic" haskFun :: F.FunPtr (F.Ptr W.Word8 -> W.Word16 -> W.Word32 -> IO Int) -> F.Ptr W.Word8 -> W.Word16 -> W.Word32 -> IO Int
+
+-- | Plumbing to pass putchar to the JIT-compiled code.
+foreign import ccall "wrapper" haskFunPut :: (W.Word32 -> IO W.Word32) -> IO (F.FunPtr (W.Word32 -> IO W.Word32))
+
+-- | Plubming to pass getchar to the JIT-compiled code.
+foreign import ccall "wrapper" haskFunGet :: IO W.Word32 -> IO (F.FunPtr (IO W.Word32))

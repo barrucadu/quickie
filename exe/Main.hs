@@ -13,8 +13,8 @@ main = getArgs >>= \case
   []         -> printHelp
   ["-h"]     -> printHelp
   ["--help"] -> printHelp
-  [fname]                    -> llcompileAndRun BF.jit                           fname
-  [fname, "--fast"]          -> llcompileAndRun BF.jit                           fname
+  [fname]                    -> compileAndRun   BF.jit                           fname
+  [fname, "--fast"]          -> compileAndRun   BF.jit                           fname
   [fname, "--slow"]          -> compileAndRun   BF.interpret                     fname
   [fname, "--verify"]        -> llcompileAndRun BF.verifyllvm                    fname
   [fname, "-o", out]         -> llcompileAndRun (BF.objcompile out)              fname
@@ -68,4 +68,4 @@ compileAndRun f fname =
 -- run the provided action.
 llcompileAndRun :: (LLVM.Module -> IO ()) -> String -> IO ()
 llcompileAndRun f fname =
-  f =<< (BF.llcompile . BF.compile <$> readFile fname)
+  f =<< (BF.llcompileForStandalone . BF.compile <$> readFile fname)
