@@ -6,12 +6,12 @@
 -- | The Quickie Brainfuck parser and compiler.
 module Language.Brainfuck where
 
-import           Control.Arrow (first)
 import           Control.Exception (try)
 import           Control.Monad (void, when)
 import           Data.Bits ((.|.), (.&.), unsafeShiftL, unsafeShiftR)
 import qualified Data.ByteString.Char8 as BS
 import           Data.Char (chr, ord)
+import qualified Data.IntMap.Strict as M
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as VM
 import qualified Data.Word as W
@@ -302,7 +302,7 @@ compile s0 = V.create (compile' (filter isbf s0)) where
     go vcode 0 chunkSize [] scode
 
   -- if there's no space left, grow the vector
-  go vcode ip sz stk cs | sz < 2 = do
+  go vcode ip 0 stk cs = do
     vcode' <- VM.unsafeGrow vcode chunkSize
     go vcode' ip chunkSize stk cs
 
@@ -338,41 +338,43 @@ compile s0 = V.create (compile' (filter isbf s0)) where
         VM.unsafeWrite vcode ip (instr (1 + fromIntegral (length eqs)))
         go vcode (ip+1) (sz-1) stk rest
 
-      -- see if a loop body corresponds to a known pattern
-      loop l0 = case l0 of
-        -- "[-]" and "[+]" zero the cell
-        ('-':']':rest) -> pushi' (Set 0) rest
-        ('+':']':rest) -> pushi' (Set 0) rest
-        -- "[-{>m}{+n}{<m}]" zeroes the cell and adds n * its value to
-        -- the cell m to the right
-        ('-':'>':rest) -> case first length (span (=='>') rest) of
-          (m1, '+':rest') -> case first length (span (=='+') rest') of
-            (n, '<':rest'') -> case first length (span (=='<') rest'') of
-              (m2, ']':rest''') | m1 == m2 -> do
-                VM.unsafeWrite vcode ip (CMulR (1 + fromIntegral m1) (1 + fromIntegral n))
-                VM.unsafeWrite vcode (ip+1) (Set 0)
-                go vcode (ip+2) (sz-2) stk rest'''
-              _ -> defloop l0
-            _ -> defloop l0
-          _ -> defloop l0
-        -- "[-{<m}{+n}{>m}]" zeroes the cell and adds n * its value to
-        -- the cell m to the left
-        ('-':'<':rest) -> case first length (span (=='<') rest) of
-          (m1, '+':rest') -> case first length (span (=='+') rest') of
-            (n, '>':rest'') -> case first length (span (=='>') rest'') of
-              (m2, ']':rest''') | m1 == m2 -> do
-                VM.unsafeWrite vcode ip (CMulL (1 + fromIntegral m1) (1 + fromIntegral n))
-                VM.unsafeWrite vcode (ip+1) (Set 0)
-                go vcode (ip+2) (sz-2) stk rest'''
-              _ -> defloop l0
-            _ -> defloop l0
-          _ -> defloop l0
-        _ -> defloop l0
+      -- see if a loop body corresponds to a known pattern:
+      --
+      -- - a loop which just adds or subtracts from the current cell
+      --   and doesn't move the data pointer will zero the current
+      --   cell, if the delta is nonzero
+      --
+      -- - a loop which adds to some other cells and decrements the
+      --   current cell by one is a copy/multiply loop
+      loop l0 = lgo (0::Int) (0::Int) M.empty l0 where
+        lgo dpoff delta factors ('>':ls) = lgo (dpoff+1) delta factors ls
+        lgo dpoff delta factors ('<':ls) = lgo (dpoff-1) delta factors ls
+        lgo dpoff delta factors ('-':ls)
+          | dpoff == 0 = lgo dpoff (delta-1) factors ls
+          | otherwise  = lgo dpoff delta (M.alter (Just . maybe (-1) (subtract 1)) dpoff factors) ls
+        lgo dpoff delta factors ('+':ls)
+          | dpoff == 0 = lgo dpoff (delta+1) factors ls
+          | otherwise  = lgo dpoff delta (M.alter (Just . maybe 1 (+1)) dpoff factors) ls
+        lgo 0 delta factors (']':ls)
+          | M.null factors && delta /= 0 = pushi' (Set 0) ls
+          | delta == -1 && all (>=0) (M.elems factors) = do
+              (vcode', sz') <- if sz < 1 + M.size factors
+                               then (\v' -> (v', sz + chunkSize)) <$> VM.unsafeGrow vcode chunkSize
+                               else pure (vcode, sz)
+              let cmul dpoff factor = if dpoff < 1
+                                      then CMulL (fromIntegral $ abs dpoff) factor
+                                      else CMulR (fromIntegral dpoff) factor
+              let (ip', m) = M.foldrWithKey' (\dpoff factor (ip', m) -> (ip' + 1, m >> VM.unsafeWrite vcode' ip' (cmul dpoff factor))) (ip, pure ()) factors
+              m
+              VM.unsafeWrite vcode' ip' (Set 0)
+              go vcode' (ip'+1) (sz' - M.size factors - 1) stk ls
+          | otherwise = defloop l0
+        lgo _ _ _ _ = defloop l0
 
-      -- a regular loop starter
-      defloop rest = do
-        VM.unsafeWrite vcode ip Hlt
-        go vcode (ip+1) (sz-1) (ip:stk) rest
+        -- a regular loop starter
+        defloop rest = do
+          VM.unsafeWrite vcode ip Hlt
+          go vcode (ip+1) (sz-1) (ip:stk) rest
     in case c of
          '>' -> pushir GoR
          '<' -> pushir GoL

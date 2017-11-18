@@ -19,7 +19,7 @@ executable quickie
 
 library
   exposed-modules:     Language.Brainfuck
-  build-depends:       base >=4.9 && <4.10, bytestring, llvm-hs, llvm-hs-pure, vector
+  build-depends:       base >=4.9 && <4.10, bytestring, containers, llvm-hs, llvm-hs-pure, vector
   hs-source-dirs:      lib
   default-language:    Haskell2010
   ghc-options:         -O2 -Wall
