@@ -29,10 +29,11 @@ d=`mktemp -d`
 cat > "$d/shim.c" <<EOF
 char mem[40000] = {0};
 
-int bfmain(char**, int);
+void bfmain(char**, int);
 
 int main(void) {
-  return bfmain((char**)&mem, 10000);
+  bfmain((char**)&mem, 10000);
+  return 0;
 }
 EOF
 for example in *.b; do

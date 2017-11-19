@@ -14,7 +14,6 @@ import           Data.Bits ((.|.), (.&.), unsafeShiftL, unsafeShiftR)
 import qualified Data.ByteString.Char8 as BS
 import           Data.Char (chr, ord)
 import qualified Data.IntMap.Strict as M
-import           Data.Maybe (fromMaybe)
 import           Data.String (IsString(..))
 import qualified Data.Vector.Unboxed as V
 import qualified Data.Vector.Unboxed.Mutable as VM
@@ -177,12 +176,23 @@ jit code = do
         LLVM.withObjectLinkingLayer $ \ol ->
         LLVM.withIRCompileLayer ol tgt $ \cl ->
         LLVM.withModule cl m (resolver cl) $ \_ -> do
-          sym <- LLVM.mangleSymbol cl bfmain
-          LLVM.JITSymbol fn _ <- LLVM.findSymbol cl sym True
-          C.putMVar fnvar $ haskFun (F.castPtrToFunPtr (F.wordPtrToPtr fn))
-          -- LLVM context is destroyed when the action terminates,
-          -- so keep the thread alive
-          C.takeMVar killvar
+          vo <- C.newEmptyMVar
+          C.putMVar fnvar vo
+          let loop = do
+                (ip, vr) <- C.takeMVar vo
+                sym <- LLVM.mangleSymbol cl (fromString $ show ip)
+                LLVM.JITSymbol fn _ <- LLVM.findSymbol cl sym True
+                if fn == 0
+                  -- couldn't find function, try again
+                  then do
+                    C.putMVar vr (Left JITNoSuchFunc)
+                    loop
+                  else do
+                    C.putMVar vr . Right $ haskFun (F.castPtrToFunPtr (F.wordPtrToPtr fn))
+                    -- LLVM context is destroyed when the action
+                    -- terminates, so keep the thread alive
+                    C.takeMVar killvar
+          loop
 
       resolver cl = LLVM.SymbolResolver (\s -> LLVM.findSymbol cl s True) $ \(LLVM.MangledSymbol s) -> pure $ if
         | s == fromString "putchar" -> LLVM.JITSymbol (F.ptrToWordPtr $ F.castFunPtrToPtr putPtr) (LLVM.JITSymbolFlags False True)
@@ -204,7 +214,10 @@ jit code = do
 -- time, then it shall call the function to jump to the compiled code.
 --
 -- You should not call this directly.
-interpretWithJIT :: Maybe (C.MVar (F.Ptr W.Word8 -> W.Word16 -> W.Word32 -> IO Int)) -> IR -> IO ()
+interpretWithJIT
+  :: Maybe (C.MVar (C.MVar (W.Word32, C.MVar (Either JITError (F.Ptr W.Word8 -> W.Word16 -> IO ())))))
+  -> IR
+  -> IO ()
 interpretWithJIT fnvar code = hSetBuffering stdout NoBuffering >> (run' =<< VSM.replicate memSize 0) where
   run' mem = go 0 initialdp where
     -- to improve performance we use unsafe vector operations
@@ -283,13 +296,17 @@ interpretWithJIT fnvar code = hSetBuffering stdout NoBuffering >> (run' =<< VSM.
 
     -- switch to the JIT if it's ready
     tryjit tgt dp = case fnvar of
-      Just fnvar' -> C.tryTakeMVar fnvar' >>= \case
-        Just fn -> VSM.unsafeWith mem $ \memptr ->
-          fn memptr (fromIntegral dp) (fromIntegral tgt) >>= \case
-            0 -> pure () -- success
-            r | r == jitNoSuchFunc -> go (tgt + 1) dp -- couldn't find function
-              | r == jitNoSuchCase -> go (tgt + 1) dp -- couldn't jump to case
-              | otherwise          -> error ("failure in JITed code: " ++ show r)
+      Just fnvar' -> C.tryReadMVar fnvar' >>= \case
+        Just vo -> VSM.unsafeWith mem $ \memptr -> do
+          vr <- C.newEmptyMVar
+          C.putMVar vo (fromIntegral tgt, vr)
+          C.takeMVar vr >>= \case
+            -- if we can't find the function, llvm may have merged it
+            -- with another or renamed it (it does that with
+            -- LostKng.b); but the next function we want might be
+            -- present.
+            Left JITNoSuchFunc -> go (tgt + 1) dp
+            Right fn -> fn memptr (fromIntegral dp)
         Nothing -> go (tgt + 1) dp
       Nothing -> go (tgt + 1) dp
 
@@ -462,8 +479,7 @@ compile s0 = V.create (compile' (filter isbf s0)) where
 --
 -- This produces a function callable from C with the type @bfmain ::
 -- (uint8_t**, uint32_t) -> uint32_t@.  The first parameter is the
--- memory array, the second is the starting data pointer address.  The
--- return value will be 0 on success.
+-- memory array, the second is the starting data pointer address.
 --
 -- With a memory array of 40,000 cells and an initial data pointer of
 -- 10,000 (to make it a bit less likely for programs to run out of
@@ -473,7 +489,7 @@ compile s0 = V.create (compile' (filter isbf s0)) where
 -- @
 --    char mem[40000] = {0};
 --
---    int bfmain(char**, int);
+--    void bfmain(char**, int);
 --
 --    int main(void) {
 --      return bfmain((char**)&mem, 10000);
@@ -483,20 +499,12 @@ compile s0 = V.create (compile' (filter isbf s0)) where
 -- Build with @quickie foo.b -o foo.o; gcc main.c foo.o -o foo@.
 llcompileForStandalone :: IR -> AST.Module
 llcompileForStandalone code = AST.defaultModule
-    { AST.moduleDefinitions =
-      [ AST.GlobalDefinition AST.functionDefaults
-        { AST.name        = AST.mkName bfmain
-        , AST.parameters  = ([AST.Parameter ty n [] | (ty, n) <- [(AST.ptr $ AST.ArrayType (fromIntegral memSize) AST.i8, mem), (AST.i16, di)]], False)
-        , AST.returnType  = AST.i32
-        , AST.basicBlocks = llcompileMainBBs mem di Nothing code
-        }
-      , extern getchar []        AST.i32
-      , extern putchar [AST.i32] AST.i32
-      ]
-    }
-  where
-    mem = AST.mkName "mem"
-    di  = AST.mkName "di"
+  { AST.moduleDefinitions =
+    [ AST.GlobalDefinition $ llcompileFun (AST.mkName bfmain) code
+    , extern getchar []        AST.i32
+    , extern putchar [AST.i32] AST.i32
+    ]
+  }
 
 -- | Compile a Quickie IR program to LLVM IR, to be invoked from the
 -- JIT interpreter.
@@ -504,33 +512,37 @@ llcompileForStandalone code = AST.defaultModule
 -- You should not call this directly.
 llcompileForJIT :: IR -> AST.Module
 llcompileForJIT code = AST.defaultModule
-    { AST.moduleDefinitions =
-      [ AST.GlobalDefinition AST.functionDefaults
-        { AST.name        = AST.mkName bfmain
-        , AST.parameters  = ([AST.Parameter ty n [] | (ty, n) <- [(AST.ptr $ AST.ArrayType (fromIntegral memSize) AST.i8, mem), (AST.i16, di), (AST.i32, tgt)]], False)
-        , AST.returnType  = AST.i32
-        , AST.basicBlocks = llcompileMainBBs mem di (Just (AST.Switch (AST.LocalReference AST.i32 tgt) exit dests [])) code
-        }
-      , extern getchar []        AST.i32
+    { AST.moduleDefinitions = map blockToFun (llcompileFunBBs True code) ++
+      [ extern getchar []        AST.i32
       , extern putchar [AST.i32] AST.i32
       ]
     }
   where
-    mem  = AST.mkName "mem"
-    di   = AST.mkName "di"
-    tgt  = AST.mkName "tgt"
-    exit = AST.mkName "exit"
-    dests = V.foldr' jmpAddrs [] code
+    blockToFun (b@(AST.BasicBlock name _ _)) =
+      AST.GlobalDefinition $ llblocksToFun name [b]
 
-    jmpAddrs (JZ  a) ds = (ASTC.Int 32 $ fromIntegral a, AST.mkName (show a)):ds
-    jmpAddrs (JNZ a) ds = (ASTC.Int 32 $ fromIntegral a, AST.mkName (show a)):ds
-    jmpAddrs _ ds = ds
-
--- | Helper for 'llcompileForStandalone' and 'llcompileForJIT'.
+-- | Compile a sequence of instructions into a function.
 --
 -- You should not call this directly.
-llcompileMainBBs :: AST.Name -> AST.Name -> Maybe AST.Terminator -> IR -> [AST.BasicBlock]
-llcompileMainBBs memname diname eterm code = reverse (exit:blocks) where
+llcompileFun :: AST.Name -> IR -> AST.Global
+llcompileFun name = llblocksToFun name . llcompileFunBBs False
+
+-- | Convert a sequence of basic blocks to a function.
+--
+-- You should not call this directly.
+llblocksToFun :: AST.Name -> [AST.BasicBlock] -> AST.Global
+llblocksToFun name blocks = AST.functionDefaults
+  { AST.name        = name
+  , AST.parameters  = ([AST.Parameter ty n [] | (ty, n) <- [(AST.ptr $ AST.ArrayType (fromIntegral memSize) AST.i8, memname), (AST.i16, diname)]], False)
+  , AST.returnType  = AST.void
+  , AST.basicBlocks = blocks
+  }
+
+-- | Helper for 'llcompileFun'.
+--
+-- You should not call this directly.
+llcompileFunBBs :: Bool -> IR -> [AST.BasicBlock]
+llcompileFunBBs blocksAreFuns code = reverse blocks where
   -- an LLVM function consists of a sequence of "basic blocks", where
   -- a basic block is a sequence of instructions followed by a single
   -- terminator.  jumping to or from the middle of a basic block is
@@ -553,20 +565,15 @@ llcompileMainBBs memname diname eterm code = reverse (exit:blocks) where
   -- about 3000 loads/stores in the mandelbrot program, and enables
   -- llvm's "mem2reg" optimisation which pushes the data pointer into
   -- a register, so it's a good optimisation to do.
-  entry = block (AST.mkName "entry")
+  header =
     [ store dp (refm16 (AST.mkName "dp0"))
     , AST.mkName "dp0" .= add (cint16 0) (refm16 diname)
     , AST.mkName "dp"  .= AST.Alloca AST.i16 Nothing 0 []
     ]
-    (fromMaybe (AST.Br (AST.mkName "bf") []) eterm)
-
-  -- used to signal unsuccessful termination, nothing in the generated
-  -- code here refers to it; but the provided terminator may.
-  exit = block (AST.mkName "exit") [] (AST.Ret (Just (AST.ConstantOperand (ASTC.Int 32 (fromIntegral jitNoSuchCase)))) [])
 
   -- as long as the IR is well formed, the final block will end
   -- with a ret and there will be no leftover instructions
-  (_, _, _, _, blocks) = V.ifoldl' gen (AST.mkName "bf", [], Clean (AST.mkName "dp0"), Nothing, [entry]) code
+  (_, _, _, _, blocks) = V.ifoldl' gen ("entry", [], Clean (AST.mkName "dp0"), Nothing, []) code
 
   -- generate code, the arguments are: 'n', the name of the current
   -- basic block; 'ops', the (reverse order) list of instructions in
@@ -684,8 +691,8 @@ llcompileMainBBs memname diname eterm code = reverse (exit:blocks) where
 
   -- ret
   gen (n, ops, dpT, _, bs) ip Hlt =
-    let b = block n ops (AST.Ret (Just (AST.ConstantOperand (ASTC.Int 32 0))) [])
-    in (AST.mkName (show ip), [], dpT, Nothing, b : bs)
+    let b = mkblock n ops (AST.Ret Nothing [])
+    in (show ip, [], dpT, Nothing, b : bs)
 
   -- unreachable if the IR is well-formed
   gen _ _ instr = error ("invalid opcode: " ++ show (instr .&. 255))
@@ -765,12 +772,23 @@ llcompileMainBBs memname diname eterm code = reverse (exit:blocks) where
     let tmpP = AST.mkName (show ip ++ ".P")
         tmp1 = AST.mkName (show ip ++ ".T1")
         tmp2 = AST.mkName (show ip ++ ".T2")
+        tmpK = AST.mkName (show ip ++ ".K")
         dp0  = AST.mkName ("dp" ++ show ip)
+        truename  = AST.mkName true
+        falsename = AST.mkName false
         storedp = case dpT of
           Clean _ -> []
           Dirty _ -> [ store dp (refm16 (tname dpT)) ]
-        term = AST.CondBr (refb tmp2) (AST.mkName true) (AST.mkName false) []
-        ops' = (case dpV of
+        term
+          | blocksAreFuns = AST.Ret Nothing []
+          | otherwise = AST.CondBr (refb tmp2) truename falsename []
+        select
+          | blocksAreFuns =
+            [ AST.Do $ callblock dpT (AST.LocalReference callblockty tmpK)
+            , tmpK .= AST.Select (refb tmp2) (gname callblockty truename) (gname callblockty falsename) []
+            ]
+          | otherwise = []
+        ops' = select ++ (case dpV of
           Just (var, st) ->
             [ st
             , tmp2 .= AST.ICmp AST.EQ (cint8 0) (refm var) []
@@ -780,9 +798,17 @@ llcompileMainBBs memname diname eterm code = reverse (exit:blocks) where
             , tmp1 .= load (refp tmpP)
             , tmpP .= gepmem (tname dpT)
             ]) ++ storedp ++ ops
-        b = block n ops' term
-    in (AST.mkName (show ip), [dp0 .= load dp], Clean dp0, Nothing, b : bs)
+        b = mkblock n ops' term
+    in (show ip, [dp0 .= load dp], Clean dp0, Nothing, b : bs)
 
+  -- call a block
+  callblockty     = funty [AST.ptr $ AST.ArrayType (fromIntegral memSize) AST.i8, AST.i16] AST.void
+  callblock dpT n = notailcall n [mem, refm16 (tname dpT)]
+
+  -- make a block
+  mkblock n ops term
+    | blocksAreFuns || n == "entry" = block (AST.mkName n) (ops ++ header) term
+    | otherwise = block (AST.mkName n) ops term
 
 -------------------------------------------------------------------------------
 -- * Internal utilities
@@ -830,6 +856,14 @@ runLLVM optimise f ast =
 -- | The name of the brainfuck \"main\" function in the LLVM IR.
 bfmain :: IsString s => s
 bfmain = fromString "bfmain"
+
+-- | Name of the memory array parameter.
+memname :: AST.Name
+memname = AST.mkName "mem"
+
+-- | Name of the data index parameter.
+diname :: AST.Name
+diname  = AST.mkName "di"
 
 -- | The C putchar stdlib function.
 putchar :: AST.Name
@@ -889,6 +923,12 @@ mul op1 op2 = AST.Mul False False op1 op2 []
 call :: AST.Operand -> [AST.Operand] -> AST.Instruction
 call fn args = AST.Call Nothing AST.C [] (Right fn) [(a, []) | a <- args] [] []
 
+-- | Definitely not a tail call!
+--
+-- TODO: Figure out why tail calls make it segfault.
+notailcall :: AST.Operand -> [AST.Operand] -> AST.Instruction
+notailcall fn args = AST.Call (Just AST.NoTail) AST.C [] (Right fn) [(a, []) | a <- args] [][]
+
 -- | Truncate a larger type to a smaller one.
 trunc :: AST.Operand -> AST.Type -> AST.Instruction
 trunc op ty = AST.Trunc op ty []
@@ -913,19 +953,24 @@ cint16 = AST.ConstantOperand . ASTC.Int 16 . fromIntegral
 block :: AST.Name -> [AST.Named AST.Instruction] -> AST.Terminator -> AST.BasicBlock
 block n ops = AST.BasicBlock n (reverse ops) . AST.Do
 
--- | Error code for the JIT failing to find the main function.
-jitNoSuchFunc :: Int
-jitNoSuchFunc = 90
-
--- | Error code for the JIT failing to find the case to jump to.
-jitNoSuchCase :: Int
-jitNoSuchCase = 91
+-- | Error responses
+data JITError
+  = JITNoSuchFunc
+  -- ^ The symbol couldn't be resolved.  This is not necessarily fatal
+  -- as, eg, in LostKng.b function "3" gets renamed but all others are
+  -- fine.
 
 -- | Plumbing to call the JIT-compiled code.
-foreign import ccall "dynamic" haskFun :: F.FunPtr (F.Ptr W.Word8 -> W.Word16 -> W.Word32 -> IO Int) -> F.Ptr W.Word8 -> W.Word16 -> W.Word32 -> IO Int
+foreign import ccall "dynamic" haskFun
+  :: F.FunPtr (F.Ptr W.Word8 -> W.Word16 -> IO ())
+  -> F.Ptr W.Word8 -> W.Word16 -> IO ()
 
 -- | Plumbing to pass putchar to the JIT-compiled code.
-foreign import ccall "wrapper" haskFunPut :: (W.Word32 -> IO W.Word32) -> IO (F.FunPtr (W.Word32 -> IO W.Word32))
+foreign import ccall "wrapper" haskFunPut
+  :: (W.Word32 -> IO W.Word32)
+  -> IO (F.FunPtr (W.Word32 -> IO W.Word32))
 
 -- | Plubming to pass getchar to the JIT-compiled code.
-foreign import ccall "wrapper" haskFunGet :: IO W.Word32 -> IO (F.FunPtr (IO W.Word32))
+foreign import ccall "wrapper" haskFunGet
+  :: IO W.Word32
+  -> IO (F.FunPtr (IO W.Word32))
