@@ -30,13 +30,15 @@ import qualified LLVM.AST.IntegerPredicate as AST
 import qualified LLVM.AST.Linkage as AST
 import qualified LLVM.AST.Type as AST
 import qualified LLVM.Context as LLVM
-import qualified LLVM.ExecutionEngine as LLVM
 import qualified LLVM.Exception as LLVM
 import qualified LLVM.Module as LLVM
+import qualified LLVM.OrcJIT as LLVM
+import qualified LLVM.Internal.OrcJIT as LLVM
 import qualified LLVM.PassManager as LLVM
 import qualified LLVM.Target as LLVM
 import qualified LLVM.Transforms as LLVM
 import           System.IO (BufferMode(..), IOMode(..), hPutStrLn, hSetBuffering, openFile, stdout)
+import           System.IO.Error (isEOFError)
 import           Text.Printf (printf)
 
 -------------------------------------------------------------------------------
@@ -160,24 +162,39 @@ interpret = interpretWithJIT Nothing
 -- completes.
 jit :: IR -> IO ()
 jit code = do
+    putcharPtr <- haskFunPut putchar_c
+    getcharPtr <- haskFunGet getchar_c
     fnvar   <- C.newEmptyMVar
     killvar <- C.newEmptyMVar
-    _ <- C.forkIO (jitCompile fnvar killvar)
+    _ <- C.forkIO (jitCompile putcharPtr getcharPtr fnvar killvar)
     interpretWithJIT (Just fnvar) code
     C.putMVar killvar ()
+    F.freeHaskellFunPtr putcharPtr
+    F.freeHaskellFunPtr getcharPtr
   where
-    jitCompile fnvar killvar = runLLVM True go (llcompileForJIT code) where
-      go _ ctx m =
-        LLVM.withMCJIT ctx (Just 1) Nothing Nothing Nothing $ \ee ->
-        LLVM.withModuleInEngine ee m $ \em ->
-        LLVM.getFunction em bfmain >>= \case
-          Just fn -> do
-            C.putMVar fnvar $ haskFun (F.castFunPtr fn)
-            -- LLVM context is destroyed when the action terminates,
-            -- so keep the thread alive
-            C.takeMVar killvar
-          Nothing ->
-            C.putMVar fnvar $ \_ _ _ -> pure jitNoSuchFunc
+    jitCompile putPtr getPtr fnvar killvar = runLLVM True go (llcompileForJIT code) where
+      go tgt m =
+        LLVM.withObjectLinkingLayer $ \ol ->
+        LLVM.withIRCompileLayer ol tgt $ \cl ->
+        LLVM.withModule cl m (resolver cl) $ \_ -> do
+          sym <- LLVM.mangleSymbol cl bfmain
+          LLVM.JITSymbol fn _ <- LLVM.findSymbol cl sym True
+          C.putMVar fnvar $ haskFun (F.castPtrToFunPtr (F.wordPtrToPtr fn))
+          -- LLVM context is destroyed when the action terminates,
+          -- so keep the thread alive
+          C.takeMVar killvar
+
+      resolver cl = LLVM.SymbolResolver (\s -> LLVM.findSymbol cl s True) $ \(LLVM.MangledSymbol s) -> pure $ if
+        | s == fromString "putchar" -> LLVM.JITSymbol (F.ptrToWordPtr $ F.castFunPtrToPtr putPtr) (LLVM.JITSymbolFlags False True)
+        | s == fromString "getchar" -> LLVM.JITSymbol (F.ptrToWordPtr $ F.castFunPtrToPtr getPtr) (LLVM.JITSymbolFlags False True)
+        | otherwise -> LLVM.JITSymbol 0 (LLVM.JITSymbolFlags False False)
+
+    putchar_c w = putChar (chr (fromIntegral w)) >> pure 0
+    getchar_c = try getChar >>= \case
+      Right w -> pure (fromIntegral (ord w))
+      Left e
+        | isEOFError e -> pure 0
+        | otherwise    -> pure 0 -- maybe distinguish these cases?
 
 -- | Helper for 'interpret' and 'jit': starts interpreting the IR,
 -- periodically checking if the JIT-compiled version is ready.
@@ -305,21 +322,21 @@ dumpir mfname ir = do
 
 -- | Dump the LLVM IR to stdout or a file.
 dumpllvm :: Maybe String -> AST.Module -> IO ()
-dumpllvm (Just fname) = runLLVM True $ \_ _ m -> LLVM.writeLLVMAssemblyToFile (LLVM.File fname) m
-dumpllvm Nothing      = runLLVM True $ \_ _ m -> LLVM.moduleLLVMAssembly m >>= BS.putStrLn
+dumpllvm (Just fname) = runLLVM True $ \_ m -> LLVM.writeLLVMAssemblyToFile (LLVM.File fname) m
+dumpllvm Nothing      = runLLVM True $ \_ m -> LLVM.moduleLLVMAssembly m >>= BS.putStrLn
 
 -- | Dump the LLVM-compiled assembly to stdout or a file.
 dumpasm :: Maybe String -> AST.Module -> IO ()
-dumpasm (Just fname) = runLLVM True $ \tgt _ m -> LLVM.writeTargetAssemblyToFile tgt (LLVM.File fname) m
-dumpasm Nothing      = runLLVM True $ \tgt _ m -> LLVM.moduleTargetAssembly tgt m >>= BS.putStrLn
+dumpasm (Just fname) = runLLVM True $ \tgt m -> LLVM.writeTargetAssemblyToFile tgt (LLVM.File fname) m
+dumpasm Nothing      = runLLVM True $ \tgt m -> LLVM.moduleTargetAssembly tgt m >>= BS.putStrLn
 
 -- | Dump the LLVM-compiled object code to a file.
 objcompile :: String -> AST.Module -> IO ()
-objcompile fname = runLLVM True $ \tgt _ m -> LLVM.writeObjectToFile tgt (LLVM.File fname) m
+objcompile fname = runLLVM True $ \tgt m -> LLVM.writeObjectToFile tgt (LLVM.File fname) m
 
 -- | Run the LLVM verifier and print out the messages.
 verifyllvm :: AST.Module -> IO ()
-verifyllvm = runLLVM False $ \_ _ m -> try (LLVM.verify m) >>= \case
+verifyllvm = runLLVM False $ \_ m -> try (LLVM.verify m) >>= \case
   Right () -> putStrLn "OK!"
   Left (LLVM.VerifyException err) -> putStr err
 
@@ -792,13 +809,13 @@ unpack28 :: Instruction -> (W.Word32, W.Word32)
 unpack28 instr = (instr .&. 15, unsafeShiftR instr 4)
 
 -- | Run an LLVM operation on a module.
-runLLVM :: Bool -> (LLVM.TargetMachine -> LLVM.Context -> LLVM.Module -> IO ()) -> AST.Module -> IO ()
+runLLVM :: Bool -> (LLVM.TargetMachine -> LLVM.Module -> IO ()) -> AST.Module -> IO ()
 runLLVM optimise f ast =
     LLVM.withHostTargetMachine $ \tgt ->
     LLVM.withContext $ \ctx ->
     LLVM.withModuleFromAST ctx ast $ \m -> do
       when optimise (LLVM.withPassManager passes $ \pm -> void (LLVM.runPassManager pm m))
-      f tgt ctx m
+      f tgt m
   where
     passes = LLVM.defaultPassSetSpec
       { LLVM.transforms =
