@@ -351,12 +351,6 @@ dumpasm Nothing      = runLLVM True $ \tgt m -> LLVM.moduleTargetAssembly tgt m 
 objcompile :: String -> AST.Module -> IO ()
 objcompile fname = runLLVM True $ \tgt m -> LLVM.writeObjectToFile tgt (LLVM.File fname) m
 
--- | Run the LLVM verifier and print out the messages.
-verifyllvm :: AST.Module -> IO ()
-verifyllvm = runLLVM False $ \_ m -> try (LLVM.verify m) >>= \case
-  Right () -> putStrLn "OK!"
-  Left (LLVM.VerifyException err) -> putStr err
-
 
 -------------------------------------------------------------------------------
 -- * Compilation
@@ -839,9 +833,13 @@ runLLVM :: Bool -> (LLVM.TargetMachine -> LLVM.Module -> IO ()) -> AST.Module ->
 runLLVM optimise f ast =
     LLVM.withHostTargetMachine $ \tgt ->
     LLVM.withContext $ \ctx ->
-    LLVM.withModuleFromAST ctx ast $ \m -> do
-      when optimise (LLVM.withPassManager passes $ \pm -> void (LLVM.runPassManager pm m))
-      f tgt m
+    LLVM.withModuleFromAST ctx ast $ \m -> try (LLVM.verify m) >>= \case
+      Right () -> do
+        when optimise (LLVM.withPassManager passes $ \pm -> void (LLVM.runPassManager pm m))
+        f tgt m
+      Left (LLVM.VerifyException err) -> do
+        putStrLn "LLVM verification errors:"
+        putStr err
   where
     passes = LLVM.defaultPassSetSpec
       { LLVM.transforms =

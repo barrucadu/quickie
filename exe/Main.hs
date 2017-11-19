@@ -16,7 +16,6 @@ main = getArgs >>= \case
   [fname]                    -> compileAndRun   BF.jit                           fname
   [fname, "--fast"]          -> compileAndRun   BF.jit                           fname
   [fname, "--slow"]          -> compileAndRun   BF.interpret                     fname
-  [fname, "--verify"]        -> llcompileAndRun BF.verifyllvm                    fname
   [fname, "-o", out]         -> llcompileAndRun (BF.objcompile out)              fname
   (fname:"--dump-ir":rest)   -> compileAndRun   (BF.dumpir   (listToMaybe rest)) fname
   (fname:"--dump-llvm":rest) -> llcompileAndRun (BF.dumpllvm (listToMaybe rest)) fname
@@ -38,9 +37,6 @@ printHelp = putStrLn $ unlines
   , ""
   , "quickie file --slow"
   , "    run the file without JIT"
-  , ""
-  , "quickie file --verify"
-  , "    run the LLVM verifier on the generated LLVM IR"
   , ""
   , "quickie file -o target"
   , "    compile the file and save the object file"
