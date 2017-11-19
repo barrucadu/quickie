@@ -9,7 +9,7 @@ module Language.Brainfuck where
 
 import qualified Control.Concurrent as C
 import           Control.Exception (try)
-import           Control.Monad (void, when)
+import           Control.Monad (void)
 import           Data.Bits ((.|.), (.&.), unsafeShiftL, unsafeShiftR)
 import qualified Data.ByteString.Char8 as BS
 import           Data.Char (chr, ord)
@@ -171,7 +171,7 @@ jit code = do
     F.freeHaskellFunPtr putcharPtr
     F.freeHaskellFunPtr getcharPtr
   where
-    jitCompile putPtr getPtr fnvar killvar = runLLVM True go (llcompileForJIT code) where
+    jitCompile putPtr getPtr fnvar killvar = runLLVM go (llcompileForJIT code) where
       go tgt m =
         LLVM.withObjectLinkingLayer $ \ol ->
         LLVM.withIRCompileLayer ol tgt $ \cl ->
@@ -339,17 +339,17 @@ dumpir mfname ir = do
 
 -- | Dump the LLVM IR to stdout or a file.
 dumpllvm :: Maybe String -> AST.Module -> IO ()
-dumpllvm (Just fname) = runLLVM True $ \_ m -> LLVM.writeLLVMAssemblyToFile (LLVM.File fname) m
-dumpllvm Nothing      = runLLVM True $ \_ m -> LLVM.moduleLLVMAssembly m >>= BS.putStrLn
+dumpllvm (Just fname) = runLLVM $ \_ m -> LLVM.writeLLVMAssemblyToFile (LLVM.File fname) m
+dumpllvm Nothing      = runLLVM $ \_ m -> LLVM.moduleLLVMAssembly m >>= BS.putStrLn
 
 -- | Dump the LLVM-compiled assembly to stdout or a file.
 dumpasm :: Maybe String -> AST.Module -> IO ()
-dumpasm (Just fname) = runLLVM True $ \tgt m -> LLVM.writeTargetAssemblyToFile tgt (LLVM.File fname) m
-dumpasm Nothing      = runLLVM True $ \tgt m -> LLVM.moduleTargetAssembly tgt m >>= BS.putStrLn
+dumpasm (Just fname) = runLLVM $ \tgt m -> LLVM.writeTargetAssemblyToFile tgt (LLVM.File fname) m
+dumpasm Nothing      = runLLVM $ \tgt m -> LLVM.moduleTargetAssembly tgt m >>= BS.putStrLn
 
 -- | Dump the LLVM-compiled object code to a file.
 objcompile :: String -> AST.Module -> IO ()
-objcompile fname = runLLVM True $ \tgt m -> LLVM.writeObjectToFile tgt (LLVM.File fname) m
+objcompile fname = runLLVM $ \tgt m -> LLVM.writeObjectToFile tgt (LLVM.File fname) m
 
 
 -------------------------------------------------------------------------------
@@ -829,13 +829,13 @@ unpack28 :: Instruction -> (W.Word32, W.Word32)
 unpack28 instr = (instr .&. 15, unsafeShiftR instr 4)
 
 -- | Run an LLVM operation on a module.
-runLLVM :: Bool -> (LLVM.TargetMachine -> LLVM.Module -> IO ()) -> AST.Module -> IO ()
-runLLVM optimise f ast =
+runLLVM :: (LLVM.TargetMachine -> LLVM.Module -> IO ()) -> AST.Module -> IO ()
+runLLVM f ast =
     LLVM.withHostTargetMachine $ \tgt ->
     LLVM.withContext $ \ctx ->
     LLVM.withModuleFromAST ctx ast $ \m -> try (LLVM.verify m) >>= \case
       Right () -> do
-        when optimise (LLVM.withPassManager passes $ \pm -> void (LLVM.runPassManager pm m))
+        void . LLVM.withPassManager passes $ \pm -> LLVM.runPassManager pm m
         f tgt m
       Left (LLVM.VerifyException err) -> do
         putStrLn "LLVM verification errors:"
