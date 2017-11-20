@@ -320,20 +320,26 @@ dumpir mfname ir = do
   where
     go h lvl ip instr =
       let prn = hPutStrLn h . printf "%.4d %s %s" ip (replicate lvl '\t')
+          s :: String -> Maybe W.Word32 -> Maybe W.Word16 -> Maybe W.Word8 -> IO ()
+          s opname ma mr mb = prn $
+            opname ++
+            maybe [] (\a -> " @" ++ show a) ma ++
+            maybe [] (\r -> " +" ++ show r) mr ++
+            maybe [] (\b -> " "  ++ show b) mb
       in case instr of
-        GoR w -> prn ("GoR  " ++ show w) >> pure lvl
-        GoL w -> prn ("GoL  " ++ show w) >> pure lvl
-        Inc w -> prn ("Inc  " ++ show w) >> pure lvl
-        Dec w -> prn ("Dec  " ++ show w) >> pure lvl
-        Set w -> prn ("Set  " ++ show w) >> pure lvl
-        CMulR a w -> prn ("CMulR @" ++ show a ++ " " ++ show w) >> pure lvl
-        CMulL a w -> prn ("CMulL @" ++ show a ++ " " ++ show w) >> pure lvl
-        JZ  a -> prn ("JZ  @" ++ show a) >> pure (lvl + 1)
-        JNZ a -> prn ("JNZ @" ++ show a) >> pure (lvl - 1)
-        PutCh -> prn "PutCh" >> pure lvl
-        GetCh -> prn "GetCh" >> pure lvl
-        Hlt   -> prn "Hlt" >> pure lvl
-        _     -> error ("invalid opcode: " ++ show (instr .&. 255))
+        CMulL   r b -> s "CMulL" Nothing  (Just r) (Just b) >> pure lvl
+        CMulR   r b -> s "CMulR" Nothing  (Just r) (Just b) >> pure lvl
+        Dec       b -> s "Dec"   Nothing  Nothing  (Just b) >> pure lvl
+        GetCh       -> s "GetCh" Nothing  Nothing  Nothing  >> pure lvl
+        GoL     r   -> s "GoL"   Nothing  (Just r) Nothing  >> pure lvl
+        GoR     r   -> s "GoR"   Nothing  (Just r) Nothing  >> pure lvl
+        Hlt         -> s "Hlt"   Nothing  Nothing  Nothing  >> pure lvl
+        Inc       b -> s "Inc"   Nothing  Nothing  (Just b) >> pure lvl
+        JNZ   a     -> s "JNZ"   (Just a) Nothing  Nothing  >> pure (lvl - 1)
+        JZ    a     -> s "JZ"    (Just a) Nothing  Nothing  >> pure (lvl + 1)
+        PutCh       -> s "PutCh" Nothing  Nothing  Nothing  >> pure lvl
+        Set       b -> s "Set"   Nothing  Nothing  (Just b) >> pure lvl
+        _ -> error ("invalid opcode: " ++ show (instr .&. 255))
 
 -- | Dump the LLVM IR to stdout or a file.
 dumpllvm :: Maybe String -> AST.Module -> IO ()
