@@ -43,23 +43,18 @@ import           Text.Printf (printf)
 -------------------------------------------------------------------------------
 -- * Quickie IR
 
--- | Instructions are 32-bit words, from least to most significant
+-- | Instructions are 64-bit words, from least to most significant
 -- bits:
 --
--- * 4 bit opcode
--- * 16 bit unsigned data pointer offset
--- * 8 bit operand
--- * 4 bits unused
---
--- OR:
---
--- * 4 bit opcode
--- * 28 bit jump target
+-- *  8 bit *op*code
+-- * 32 bit *a*bsolute address (optional)
+-- * 16 bit *r*elative address (optional)
+-- *  8 bit operand *b*yte     (optional)
 --
 -- Well-formed instructions are those constructed by the pattern
 -- synonyms.  Any other instruction is ill-formed and may lead to a
 -- runtime error.
-type Instruction = W.Word32
+type Instruction = W.Word64
 
 -- | Quickie IR is just a sequence of instructions to execute.
 --
@@ -79,56 +74,56 @@ type IR = V.Vector Instruction
 --
 -- The operand is how far to move by.
 pattern GoR :: W.Word16 -> Instruction
-pattern GoR w <- (unpack -> (0, w, _)) where GoR w = pack 0 w 0
+pattern GoR r <- (unpack -> (0, _, r, _)) where GoR r = pack 0 0 r 0
 
 -- | Move the data pointer to the \"left\" (beginning) of the memory
 -- array.
 --
 -- The operand is how far to move by.
 pattern GoL :: W.Word16 -> Instruction
-pattern GoL w <- (unpack -> (1, w, _)) where GoL w = pack 1 w 0
+pattern GoL r <- (unpack -> (1, _, r, _)) where GoL r = pack 1 0 r 0
 
 -- | Increment (with wrapping) the value under the data pointer.
 --
 -- The operand is how much to increment by.
 pattern Inc :: W.Word8 -> Instruction
-pattern Inc w <- (unpack -> (2, _, w)) where Inc w = pack 2 0 w
+pattern Inc b <- (unpack -> (2, _, _, b)) where Inc b = pack 2 0 0 b
 
 -- | Decrement (with wrapping) the value under the data pointer.
 --
 -- The operand is how much to decrement by.
 pattern Dec :: W.Word8 -> Instruction
-pattern Dec w <- (unpack -> (3, _, w)) where Dec w = pack 3 0 w
+pattern Dec b <- (unpack -> (3, _, _, b)) where Dec b = pack 3 0 0 b
 
 -- | Set the value under the data pointer to a constant.
 --
 -- The operand is the value to set.
 pattern Set :: W.Word8 -> Instruction
-pattern Set w <- (unpack -> (4, _, w)) where Set w = pack 4 0 w
+pattern Set b <- (unpack -> (4, _, _, b)) where Set b = pack 4 0 0 b
 
 -- | Add the value of the current cell to another (given by dp offset
 -- to the right) with a multiplier.
 pattern CMulR :: W.Word16 -> W.Word8 -> Instruction
-pattern CMulR a w <- (unpack -> (10, a, w)) where CMulR a w = pack 10 a w
+pattern CMulR r b <- (unpack -> (10, _, r, b)) where CMulR r b = pack 10 0 r b
 
 -- | Add the value of the current cell to another (given by dp offset
 -- to the left) with a multiplier.
 pattern CMulL :: W.Word16 -> W.Word8 -> Instruction
-pattern CMulL a w <- (unpack -> (11, a, w)) where CMulL a w = pack 11 a w
+pattern CMulL r b <- (unpack -> (11, _, r, b)) where CMulL r b = pack 11 0 r b
 
 -- | Jump if the value under the data pointer is zero.
 --
 -- The operand is the address to jump to.  The address should not
 -- exceed @2^28-1@.
 pattern JZ :: W.Word32 -> Instruction
-pattern JZ a <- (unpack28 -> (5, a)) where JZ a = pack28 5 a
+pattern JZ a <- (unpack -> (5, a, _, _)) where JZ a = pack 5 a 0 0
 
 -- | Jump if the value under the data pointer is nonzero.
 --
 -- The operand is the address to jump to.  The address should not
 -- exceed @2^28-1@.
 pattern JNZ :: W.Word32 -> Instruction
-pattern JNZ a <- (unpack28 -> (6, a)) where JNZ a = pack28 6 a
+pattern JNZ a <- (unpack -> (6, a, _, _)) where JNZ a = pack 6 a 0 0
 
 -- | Print the value under the data pointer as an ASCII character
 -- code.
@@ -810,23 +805,21 @@ llcompileFunBBs blocksAreFuns code = reverse blocks where
 -- | Pack an instruction from its components.
 --
 -- You should not use this directly.
-pack :: W.Word32 -> W.Word16 -> W.Word8 -> Instruction
-pack op arg1 arg2 = op .|. unsafeShiftL (fromIntegral arg1) 4 .|. unsafeShiftL (fromIntegral arg2) 20
+pack :: W.Word8 -> W.Word32 -> W.Word16 -> W.Word8 -> Instruction
+pack op a r b =
+  fromIntegral op .|.
+  unsafeShiftL (fromIntegral a)  8 .|.
+  unsafeShiftL (fromIntegral r) 40 .|.
+  unsafeShiftL (fromIntegral b) 56
 
 -- | Unpack an instruction.
-unpack :: Instruction -> (W.Word32, W.Word16, W.Word8)
-unpack instr = (instr .&. 15, fromIntegral (unsafeShiftR instr 4 .&. 65535), fromIntegral (unsafeShiftR instr 20 .&. 255))
-
--- | Pack an address instruction from its components.
---
--- You should not use this directly.  The address should not exceed
--- @2^28-1@.
-pack28 :: W.Word32 -> W.Word32 -> Instruction
-pack28 op addr = op .|. unsafeShiftL addr 4
-
--- | Unpack an address instruction.
-unpack28 :: Instruction -> (W.Word32, W.Word32)
-unpack28 instr = (instr .&. 15, unsafeShiftR instr 4)
+unpack :: Instruction -> (W.Word8, W.Word32, W.Word16, W.Word8)
+unpack instr =
+  ( fromIntegral $              instr    .&.        255
+  , fromIntegral $ unsafeShiftR instr  8 .&. 4294967295
+  , fromIntegral $ unsafeShiftR instr 40 .&.      65535
+  , fromIntegral $ unsafeShiftR instr 56
+  )
 
 -- | Run an LLVM operation on a module.
 runLLVM :: (LLVM.TargetMachine -> LLVM.Module -> IO ()) -> AST.Module -> IO ()
