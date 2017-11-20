@@ -36,7 +36,7 @@ import qualified LLVM.Internal.OrcJIT as LLVM
 import qualified LLVM.PassManager as LLVM
 import qualified LLVM.Target as LLVM
 import qualified LLVM.Transforms as LLVM
-import           System.IO (BufferMode(..), IOMode(..), hPutStrLn, hSetBuffering, openFile, stdout)
+import           System.IO (IOMode(..), hFlush, hPutStrLn, openFile, stdout)
 import           System.IO.Error (isEOFError)
 import           Text.Printf (printf)
 
@@ -195,11 +195,13 @@ jit code = do
         | otherwise -> LLVM.JITSymbol 0 (LLVM.JITSymbolFlags False False)
 
     putchar_c w = putChar (chr (fromIntegral w)) >> pure 0
-    getchar_c = try getChar >>= \case
-      Right w -> pure (fromIntegral (ord w))
-      Left e
-        | isEOFError e -> pure 0
-        | otherwise    -> pure 0 -- maybe distinguish these cases?
+    getchar_c = do
+      hFlush stdout
+      try getChar >>= \case
+        Right w -> pure (fromIntegral (ord w))
+        Left e
+          | isEOFError e -> pure 0
+          | otherwise    -> pure 0 -- maybe distinguish these cases?
 
 -- | Helper for 'interpret' and 'jit': starts interpreting the IR,
 -- periodically checking if the JIT-compiled version is ready.
@@ -213,7 +215,7 @@ interpretWithJIT
   :: Maybe (C.MVar (C.MVar (W.Word32, C.MVar (Either JITError (F.Ptr W.Word8 -> W.Word16 -> IO ())))))
   -> IR
   -> IO ()
-interpretWithJIT fnvar code = hSetBuffering stdout NoBuffering >> (run' =<< VSM.replicate memSize 0) where
+interpretWithJIT fnvar code = run' =<< VSM.replicate memSize 0 where
   run' mem = go 0 initialdp where
     -- to improve performance we use unsafe vector operations
     -- everywhere, and do bounds checking only where necessary; in
@@ -279,6 +281,7 @@ interpretWithJIT fnvar code = hSetBuffering stdout NoBuffering >> (run' =<< VSM.
 
       -- mem[dp] = getchar()
       GetCh -> do
+        hFlush stdout
         w <- fromIntegral . ord <$> getChar
         VSM.unsafeWrite mem dp w
         go (ip+1) dp
