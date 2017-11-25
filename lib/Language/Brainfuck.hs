@@ -20,7 +20,6 @@ import qualified Data.Vector.Unboxed.Mutable as VM
 import qualified Data.Vector.Storable.Mutable as VSM
 import qualified Data.Word as W
 import qualified Foreign.Ptr as F
-import qualified LLVM.Analysis as LLVM
 import qualified LLVM.AST as AST hiding (type')
 import qualified LLVM.AST.CallingConvention as AST
 import qualified LLVM.AST.Constant as ASTC
@@ -28,12 +27,16 @@ import qualified LLVM.AST.Global as AST
 import qualified LLVM.AST.IntegerPredicate as AST
 import qualified LLVM.AST.Linkage as AST
 import qualified LLVM.AST.Type as AST
+import qualified LLVM.Analysis as LLVM
+import qualified LLVM.CodeGenOpt as CodeGenOpt
+import qualified LLVM.CodeModel as CodeModel
 import qualified LLVM.Context as LLVM
 import qualified LLVM.Exception as LLVM
+import qualified LLVM.Internal.OrcJIT as LLVM
 import qualified LLVM.Module as LLVM
 import qualified LLVM.OrcJIT as LLVM
-import qualified LLVM.Internal.OrcJIT as LLVM
 import qualified LLVM.PassManager as LLVM
+import qualified LLVM.Relocation as Reloc
 import qualified LLVM.Target as LLVM
 import qualified LLVM.Transforms as LLVM
 import           System.IO (IOMode(..), hFlush, hPutStrLn, openFile, stdout)
@@ -295,16 +298,13 @@ interpretWithJIT fnvar code = run' =<< VSM.replicate memSize 0 where
     -- switch to the JIT if it's ready
     tryjit tgt dp = case fnvar of
       Just fnvar' -> C.tryReadMVar fnvar' >>= \case
-        Just vo -> VSM.unsafeWith mem $ \memptr -> do
+        Just vo -> do
           vr <- C.newEmptyMVar
           C.putMVar vo (fromIntegral tgt, vr)
           C.takeMVar vr >>= \case
-            -- if we can't find the function, llvm may have merged it
-            -- with another or renamed it (it does that with
-            -- LostKng.b); but the next function we want might be
-            -- present.
+            Right fn -> VSM.unsafeWith mem $ \memptr ->
+              fn memptr (fromIntegral dp)
             Left JITNoSuchFunc -> go (tgt + 1) dp
-            Right fn -> fn memptr (fromIntegral dp)
         Nothing -> go (tgt + 1) dp
       Nothing -> go (tgt + 1) dp
 
@@ -564,8 +564,8 @@ llcompileFunBBs blocksAreFuns code = reverse blocks where
   -- llvm's "mem2reg" optimisation which pushes the data pointer into
   -- a register, so it's a good optimisation to do.
   header =
-    [ store dp (refm16 (AST.mkName "dp0"))
-    , AST.mkName "dp0" .= add (cint16 0) (refm16 diname)
+    [ AST.mkName "dp0" .= load dp
+    , store dp (refm16 diname)
     , AST.mkName "dp"  .= AST.Alloca AST.i16 Nothing 0 []
     ]
 
@@ -718,7 +718,8 @@ llcompileFunBBs blocksAreFuns code = reverse blocks where
   dp = AST.LocalReference (AST.ptr AST.i16) (AST.mkName "dp")
 
   -- the global memory
-  mem = AST.LocalReference (AST.ArrayType (fromIntegral memSize) AST.i8) memname
+  mem = AST.LocalReference (AST.ptr memty) memname
+  memty = AST.ArrayType (fromIntegral memSize) AST.i8
 
   -- index into the global memory
   gepmem idx = gep mem [cint8 0, refm16 idx]
@@ -800,8 +801,8 @@ llcompileFunBBs blocksAreFuns code = reverse blocks where
     in (show ip, [dp0 .= load dp], Clean dp0, Nothing, b : bs)
 
   -- call a block
-  callblockty     = funty [AST.ptr $ AST.ArrayType (fromIntegral memSize) AST.i8, AST.i16] AST.void
-  callblock dpT n = notailcall n [mem, refm16 (tname dpT)]
+  callblockty     = funty [AST.ptr memty, AST.i16] AST.void
+  callblock dpT n = tailcall n [mem, refm16 (tname dpT)]
 
   -- make a block
   mkblock n ops term
@@ -833,7 +834,7 @@ unpack instr =
 -- | Run an LLVM operation on a module.
 runLLVM :: (LLVM.TargetMachine -> LLVM.Module -> IO ()) -> AST.Module -> IO ()
 runLLVM f ast =
-    LLVM.withHostTargetMachine $ \tgt ->
+    withHostTargetMachine $ \tgt ->
     LLVM.withContext $ \ctx ->
     LLVM.withModuleFromAST ctx ast $ \m -> try (LLVM.verify m) >>= \case
       Right () -> do
@@ -852,6 +853,19 @@ runLLVM f ast =
         , LLVM.SimplifyControlFlowGraph
         ]
       }
+
+-- | Custom withHostTargetMachine function
+--
+-- See https://github.com/llvm-hs/llvm-hs/issues/152
+withHostTargetMachine :: (LLVM.TargetMachine -> IO a) -> IO a
+withHostTargetMachine f = do
+  LLVM.initializeAllTargets
+  triple <- LLVM.getProcessTargetTriple
+  cpu <- LLVM.getHostCPUName
+  features <- LLVM.getHostCPUFeatures
+  (target, _) <- LLVM.lookupTarget Nothing triple
+  LLVM.withTargetOptions $ \options ->
+    LLVM.withTargetMachine target triple cpu features options Reloc.PIC CodeModel.Default CodeGenOpt.Default f
 
 -- | The name of the brainfuck \"main\" function in the LLVM IR.
 bfmain :: IsString s => s
@@ -923,11 +937,9 @@ mul op1 op2 = AST.Mul False False op1 op2 []
 call :: AST.Operand -> [AST.Operand] -> AST.Instruction
 call fn args = AST.Call Nothing AST.C [] (Right fn) [(a, []) | a <- args] [] []
 
--- | Definitely not a tail call!
---
--- TODO: Figure out why tail calls make it segfault.
-notailcall :: AST.Operand -> [AST.Operand] -> AST.Instruction
-notailcall fn args = AST.Call (Just AST.NoTail) AST.C [] (Right fn) [(a, []) | a <- args] [][]
+-- | Tail call a function.
+tailcall :: AST.Operand -> [AST.Operand] -> AST.Instruction
+tailcall fn args = AST.Call (Just AST.MustTail) AST.C [] (Right fn) [(a, []) | a <- args] [][]
 
 -- | Truncate a larger type to a smaller one.
 trunc :: AST.Operand -> AST.Type -> AST.Instruction
